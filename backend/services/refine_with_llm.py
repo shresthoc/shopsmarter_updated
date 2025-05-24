@@ -196,77 +196,112 @@ class RefinementService:
 
     def analyze_query(self, query: str, current_results: List[Dict]) -> FilterCriteria:
         """Analyze user query and current results to extract filter criteria."""
-        logger.info("analyze_query: Temporarily bypassing LLM filter extraction and returning default criteria.")
-        return FilterCriteria() # <-- TEMPORARY SIMPLIFICATION
+        # logger.info("analyze_query: Temporarily bypassing LLM filter extraction and returning default criteria.")
+        # return FilterCriteria() # <-- REMOVING TEMPORARY SIMPLIFICATION
 
-        # Original logic commented out for now:
-        # if not query or not current_results:
-        #     return FilterCriteria()
+        # Original logic reinstated and enhanced:
+        if not query and not current_results: # Allow if at least one is present
+            logger.warning("analyze_query called with no query and no current_results. Returning default criteria.")
+            return FilterCriteria()
+        
+        if not query: # If query is empty (e.g. initial call with only image)
+            logger.info("analyze_query: No explicit query text provided. Will rely on current_results if available or return default criteria.")
+            # If we only have current_results, LLM might not be effective for criteria extraction without a guiding query.
+            # For now, if no query string, return default. This can be enhanced later.
+            return FilterCriteria() 
 
-        # try:
-        #     # Add unique IDs to products if not present
-        #     for p in current_results:
-        #         if 'id' not in p:
-        #             p['id'] = str(uuid.uuid4())
+        try:
+            # Ensure products have IDs for potential use in LLM context (though current prompt uses titles/prices)
+            # This was more relevant for the rerank prompt; for filter extraction, less so.
+            # for p in current_results:
+            #     if 'id' not in p:
+            #         p['id'] = str(uuid.uuid4())
 
-        #     summary = "\\n".join(f"- {p['title']} ({p.get('price','N/A')})" for p in current_results[:3])
-        #     instructions = self.parser.get_format_instructions()
-        #     logger.debug("Analyzing query with LLMChain for filter criteria")
+            # Summarize results for the prompt - avoid overly long prompts
+            # The prompt expects a summary, not the full list of dicts.
+            summary_items = []
+            if current_results:
+                for p in current_results[:5]: # Max 5 items for summary
+                    title = p.get('title', 'N/A')
+                    price = p.get('price', 'N/A')
+                    currency = p.get('currency', '')
+                    summary_items.append(f"- {title} ({currency}{price})")
+            results_summary = "\\n".join(summary_items) if summary_items else "No current results to summarize."
             
-        #     # This is where the 'str' object does not support item assignment error was happening
-        #     raw = self.filter_extraction_chain.run({
-        #         'query': query,
-        #         'current_results': summary,
-        #         'format_instructions': instructions
-        #     })
+            instructions = self.parser.get_format_instructions()
+            logger.debug(f"Analyzing query '{query[:100]}...' with LLMChain for filter criteria. Results summary: {results_summary[:200]}...")
             
-        #     logger.debug(f"Raw LLM output for filter criteria: {raw}")
+            raw_llm_output = self.filter_extraction_chain.run({
+                'query': query,
+                'current_results': results_summary, # Pass the summarized string
+                'format_instructions': instructions
+            })
+            
+            logger.debug(f"Raw LLM output for filter criteria: {raw_llm_output}")
 
-        #     # If the chain already returns a FilterCriteria object due to PydanticOutputParser
-        #     if isinstance(raw, FilterCriteria):
-        #         criteria = raw
-        #     # Else, if it's a dict (e.g., from a different parser setup or if LLM returns dict-like string)
-        #     elif isinstance(raw, dict):
-        #         criteria = FilterCriteria.parse_obj(raw)
-        #     # Else, if it's a string (expected to be JSON)
-        #     elif isinstance(raw, str):
-        #         try:
-        #             parsed_json = json.loads(raw)
-        #             criteria = FilterCriteria.parse_obj(parsed_json)
-        #         except json.JSONDecodeError:
-        #             logger.error(f"Failed to decode JSON from LLM for criteria: {raw}")
-        #             raise OutputParserException(f"LLM output for criteria is not valid JSON: {raw}")
-        #     else:
-        #         logger.error(f"Unexpected output type from LLM chain for criteria: {type(raw)}")
-        #         raise OutputParserException(f"Cannot parse criteria from type: {type(raw)}")
+            criteria = FilterCriteria() # Default empty criteria
+            if isinstance(raw_llm_output, FilterCriteria): # If PydanticOutputParser worked directly
+                criteria = raw_llm_output
+                logger.info(f"PydanticOutputParser directly returned FilterCriteria object: {criteria.dict()}")
+            elif isinstance(raw_llm_output, dict): # If LLMChain somehow returned a dict
+                criteria = FilterCriteria.parse_obj(raw_llm_output)
+                logger.info(f"Parsed FilterCriteria from dict output: {criteria.dict()}")
+            elif isinstance(raw_llm_output, str): # If LLM returned a string (hopefully JSON)
+                logger.debug("LLM output for criteria is a string, attempting JSON parsing.")
+                try:
+                    # Clean common LLM artifacts like backticks around JSON
+                    cleaned_llm_output = raw_llm_output.strip().strip('```json').strip('```').strip()
+                    if not cleaned_llm_output:
+                        logger.warning("LLM output for criteria was an empty or whitespace-only string after cleaning.")
+                    else:
+                        parsed_json = json.loads(cleaned_llm_output)
+                        criteria = FilterCriteria.parse_obj(parsed_json)
+                        logger.info(f"Parsed FilterCriteria from JSON string: {criteria.dict()}")
+                except json.JSONDecodeError as json_e:
+                    logger.error(f"Failed to decode JSON from LLM for criteria: {json_e}. Raw string: '{cleaned_llm_output}'")
+                    # Do not raise an exception here, fall through to spaCy as LLM failed to produce valid criteria JSON
+                except Exception as e_parse: # Catch other pydantic parsing errors
+                    logger.error(f"Error parsing FilterCriteria from LLM string output (even if JSON was valid): {e_parse}. Raw string: '{cleaned_llm_output}'")
+            else:
+                logger.error(f"Unexpected output type from LLM chain for criteria: {type(raw_llm_output)}. Output: {str(raw_llm_output)[:200]}")
 
-        #     logger.info(f"Parsed criteria: {criteria}")
-        #     return criteria
-        # except OutputParserException as ope: # Catch specific parser errors
-        #     logger.error(f"OutputParserException in analyze_query: {str(ope)}")
-        # except Exception as e:
-        #     logger.error(f"Error in analyze_query LLM section: {str(e)} - Query: '{query}'")
-        #     logger.error(traceback.format_exc())
+            # If criteria remains default (empty) after trying LLM, it means LLM failed.
+            # The initial log for this path will be "Falling back to basic spaCy..."
+            if criteria == FilterCriteria(): # Check if it's still the default empty one
+                 # If we reached here, it means parsing itself (if it happened) was okay, but the resulting criteria object is empty.
+                 # This could be due to an actual parsing error (logged earlier) or the LLM determining no specific criteria were applicable from the input.
+                 if isinstance(raw_llm_output, FilterCriteria) or (isinstance(raw_llm_output, str) and 'parsed_json' in locals()):
+                     logger.info("LLM analysis resulted in default/empty filter criteria (no specific filters found in query/results). Proceeding to spaCy fallback for potential enhancement.")
+                 else: # Implies a more direct failure in LLM output processing if not already caught
+                     logger.warning("LLM filter criteria extraction failed or produced no usable criteria. Proceeding to spaCy fallback.")
+            else:
+                logger.info(f"Successfully extracted specific filter criteria using LLM: {criteria.dict()}")
+                return criteria # Return LLM-derived criteria
 
+        except Exception as e:
+            logger.error(f"Core error in analyze_query LLM section: {str(e)} - Query: '{query[:100]}...'")
+            logger.error(traceback.format_exc()) 
+            # Fall through to spaCy fallback if any major error in LLM processing block
 
-        # # Fallback to basic extraction
-        # logger.info("Falling back to basic spaCy keyword extraction for filters.")
-        # if not isinstance(query, str): # Defensive check
-        #     logger.error(f"analyze_query fallback: query is not a string! Got: {type(query)}. Using empty query.")
-        #     query_for_fallback = ""
-        # else:
-        #     query_for_fallback = query
+        # Fallback to basic spaCy keyword extraction if LLM fails or produces no criteria
+        logger.info(f"Falling back to basic spaCy keyword extraction for filters based on query: '{query[:100]}...'")
+        if not isinstance(query, str): # Defensive check
+            logger.error(f"analyze_query spaCy fallback: query is not a string! Got: {type(query)}. Using empty query.")
+            query_for_fallback = ""
+        else:
+            query_for_fallback = query
 
-        # min_p, max_p = self.extract_price_range(query_for_fallback)
-        # styles = self.extract_style_keywords(query_for_fallback)
-        # return FilterCriteria(
-        #     min_price=min_p,
-        #     max_price=max_p,
-        #     style_keywords=styles,
-        #     color_preferences=[],
-        #     excluded_terms=[],
-        #     sort_by="relevance"
-        # )
+        min_p, max_p = self.extract_price_range(query_for_fallback)
+        styles = self.extract_style_keywords(query_for_fallback)
+        # For spaCy fallback, we don't have excluded_terms or complex color_preferences or sort_by from query alone easily.
+        return FilterCriteria(
+            min_price=min_p,
+            max_price=max_p,
+            style_keywords=styles,
+            color_preferences=[],
+            excluded_terms=[],
+            sort_by="relevance" # Default sort for spaCy fallback
+        )
 
     def apply_filters(self, products: List[Dict], criteria: FilterCriteria) -> List[Dict]:
         """Apply filter criteria to product list."""
@@ -457,35 +492,45 @@ class RefinementService:
 
     def refine_results(self, query: str, products: List[Dict]) -> List[Dict]:
         """Main refinement pipeline: analyze query, filter, and rerank products."""
-        logger.info(f"refine_results: Received {len(products)} products initially. Query: '{str(query)[:100]}'") # Log length and type of input
+        logger.info(f"refine_results: Received {len(products)} products initially. Query: '{str(query)[:100]}'")
 
-        # Temporarily return products immediately to isolate issues
-        logger.info(f"refine_results: Temporarily returning {len(products)} products directly without further processing.")
-        return products
+        # Original logic reinstated:
+        if not query and not products: # Allow if query or products (or both) are present
+            logger.warning("Refine_results called with no query and no products. Returning empty list.")
+            return []
+        
+        if not products: # If no products, no refinement to do
+            logger.info("Refine_results called with no products to refine. Returning empty list.")
+            return []
 
-        # Original logic commented out:
-        # if not query or not products:
-        #     logger.warning("Refine_results called with empty query or products. Returning products as is.")
-        #     return products
+        # If there's no query string but there are products, we can't effectively use analyze_query for LLM criteria extraction.
+        # We might still apply some default filtering or ranking, or just return products.
+        # For now, if no query, we'll just apply basic filters (which will be empty by default) and rerank (which will do nothing with no criteria).
+        if not query:
+            logger.info("Refine_results: No query string provided. Proceeding with default/empty criteria for filtering and ranking.")
+            # This will effectively mean apply_filters and rerank won't change much unless they have non-criteria-based logic.
 
-        # try:
-        #     criteria = self.analyze_query(query, products) 
-        #     logger.info(f"refine_results: Criteria after analyze_query: {criteria.dict() if criteria else 'None'}")
+        try:
+            # `query` here is the context string from app.py (e.g., BLIP caption or user prompt)
+            # `products` here is the list of top N products (e.g., 10 items)
+            criteria = self.analyze_query(query, products) 
+            logger.info(f"refine_results: Criteria after analyze_query: {criteria.dict() if criteria else 'None'}")
             
-        #     # Defensive copy before filtering
-        #     products_to_filter = [p.copy() for p in products] if products else []
+            # Defensive copy before filtering
+            products_to_filter = [p.copy() for p in products] if products else [] 
             
-        #     filtered = self.apply_filters(products_to_filter, criteria) 
-        #     logger.info(f"refine_results: Filtered to {len(filtered)} products.")
+            filtered_products = self.apply_filters(products_to_filter, criteria) 
+            logger.info(f"refine_results: Filtered to {len(filtered_products)} products.")
             
-        #     # Defensive copy before reranking
-        #     products_to_rerank = [p.copy() for p in filtered] if filtered else []
+            # Defensive copy before reranking
+            products_to_rerank = [p.copy() for p in filtered_products] if filtered_products else []
 
-        #     final = self.rerank(products_to_rerank, criteria) 
-        #     logger.info(f"Final results: {len(final)} products")
-        #     return final
-        # except Exception as e:
-        #     logger.error(f"Error in refine_results: {str(e)}")
-        #     logger.error(traceback.format_exc()) 
-        #     # Fallback to a fresh copy of the original products list if errors occur
-        #     return [p.copy() for p in products] if products else []
+            final_products = self.rerank(products_to_rerank, criteria) 
+            logger.info(f"refine_results: Final results after rerank: {len(final_products)} products")
+            return final_products
+        except Exception as e:
+            logger.error(f"Error in refine_results main block: {str(e)}")
+            logger.error(traceback.format_exc()) 
+            # Fallback to a fresh copy of the original products list if errors occur during refinement steps
+            logger.warning("Falling back to returning a copy of the original products received by refine_results due to an error.")
+            return [p.copy() for p in products] if products else []

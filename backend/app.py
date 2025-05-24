@@ -74,6 +74,129 @@ rapidapi_flipkart_service: Optional[BaseRapidApiService] = None # RE-ADDED for F
 blip_processor: Optional[BlipProcessor] = None
 blip_model: Optional[BlipForConditionalGeneration] = None
 
+# Stores details from the last successful search to provide conversational context
+last_search_context: Dict = {}
+
+# Known common object types for simple parsing
+KNOWN_OBJECT_TYPES = {
+    'shirt', 't-shirt', 'jacket', 'dress', 'pants', 'shoes', 'top', 'blouse', 'skirt', 'jeans', 'sweater', 'coat',
+    'shirts', 't-shirts', 'jackets', 'dresses', 'shoe', 'tops', 'blouses', 'skirts', 'sweaters', 'coats' # Added plurals & shoe singular
+}
+COMMON_STOP_WORDS = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'on', 'in', 'at', 'to', 'for', 'with', 'of', 'by', 'and', 'or', 'but', 'it', 'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our', 'their', 'men', "men's", 'womens', "women's", 'lady', "lady's"} # Added some common gendered words that are often not core attributes
+COMMON_COLORS = {"red", "blue", "green", "yellow", "black", "white", "pink", "purple", "orange", "brown", "gray", "grey", "beige", "navy", "teal", "maroon", "olive", "silver", "gold"}
+
+# Keywords indicating a reference to the last search context
+CONTEXTUAL_REFERENCE_KEYWORDS = {
+    # General references to previous item
+    "last item", "previous item", "last one", "that one", 
+    "similar to last", "like the last", "like that",
+    
+    # References to attributes of the last item
+    "that color", "that colour", "its color", "its colour",
+    "same color", "same colour", "in that color", "in that colour",
+    "in the color of", "in the colour of", # More flexible
+    "color of last", "colour of last",
+    
+    # References to type of last item (will also be covered by loop below but good to have common ones)
+    "last t-shirt", "last shirt", "last jacket", "last dress",
+    
+    # General similarity
+    "similar to that",
+}
+
+# Add more specific item references and phrases like "... of the last [item_type]"
+for item_type in KNOWN_OBJECT_TYPES:
+    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"last {item_type}")
+    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"the last {item_type}") # Handles "...of the last tshirt"
+    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"previous {item_type}")
+    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"color of the last {item_type}")
+    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"colour of the last {item_type}")
+
+def parse_new_item_type_from_prompt(prompt_text: str, known_types: set) -> Optional[str]:
+    """Tries to find a new explicit item type in a contextual prompt."""
+    words = prompt_text.lower().split()
+    # Search for known types, prioritizing multi-word types if they exist in known_types
+    # For simplicity, just iterates. A more robust parser would be better.
+    
+    # Check for two-word types first
+    for i in range(len(words) - 1):
+        two_word_type = f"{words[i]} {words[i+1]}"
+        logger.debug(f"Contextual parse (new type): Checking two-word: '{two_word_type}'")
+        if two_word_type in known_types:
+            if f"last {two_word_type}" not in prompt_text.lower() and \
+               f"previous {two_word_type}" not in prompt_text.lower():
+                logger.debug(f"Contextual parse: Found new two-word item type: '{two_word_type}'")
+                return two_word_type
+
+    # Check for single-word types
+    for word in words:
+        logger.debug(f"Contextual parse (new type): Checking single-word: '{word}'")
+        if word in known_types:
+            if f"last {word}" not in prompt_text.lower() and \
+               f"previous {word}" not in prompt_text.lower():
+                logger.debug(f"Contextual parse: Found new single-word item type: '{word}'")
+                return word
+    logger.debug(f"Contextual parse: No new item type found in prompt: '{prompt_text}'")
+    return None
+
+def extract_key_elements_from_query(query: str) -> Dict[str, any]:
+    """
+    Extracts primary object type and attributes from a search query string.
+    This is a heuristic-based approach.
+    """
+    if not query or not isinstance(query, str):
+        return {"primary_object_type": None, "primary_attributes": []}
+
+    words = query.lower().split()
+    # Filter out stop words early, but keep original words for object type matching if they are part of a multi-word type
+    # For attribute extraction, we'll use the filtered list.
+    potential_attribute_words = [word for word in words if word not in COMMON_STOP_WORDS]
+    
+    # Attempt to find a known object type by checking from the end of the query (using original words for type matching)
+    primary_object_type = None
+    # Explicitly check for "t-shirt" variations
+    if "t-shirt" in KNOWN_OBJECT_TYPES: # Ensure "t-shirt" is the canonical form we want
+        if "t-shirt" in query.lower() or "t - shirt" in query.lower(): # Check both forms
+            primary_object_type = "t-shirt" # Standardize to "t-shirt"
+            logger.debug(f"extract_key_elements: Found 't-shirt' (or variant). primary_object_type set to: {primary_object_type}")
+    
+    if not primary_object_type:
+        logger.debug(f"extract_key_elements: 't-shirt' not found or not primary (after specific check). Proceeding to general object type search.")
+        # Loop backwards through original words to give precedence to terms at the end (often the main noun)
+        for i in range(len(words) -1, -1, -1):
+            # Check two words phrase first in this loop to catch things like "summer dress" before just "dress"
+            if i > 0:
+                two_word_candidate = f"{words[i-1]} {words[i]}"
+                if two_word_candidate in KNOWN_OBJECT_TYPES:
+                    primary_object_type = two_word_candidate
+                    logger.debug(f"extract_key_elements: Found two-word type: '{primary_object_type}'")
+                    break 
+            
+            # Check single word
+            single_word_candidate = words[i]
+            if single_word_candidate in KNOWN_OBJECT_TYPES:
+                primary_object_type = single_word_candidate
+                logger.debug(f"extract_key_elements: Found single-word type: '{primary_object_type}'")
+                break # Found an object type, break from loop
+    else:
+        logger.debug(f"extract_key_elements: primary_object_type already set to '{primary_object_type}'. Skipping general search.")
+
+    attributes = []
+    if primary_object_type:
+        object_type_words = set(primary_object_type.split())
+        # Use potential_attribute_words for attribute extraction now
+        # potential_attribute_words are already filtered from COMMON_STOP_WORDS
+        attributes = [word for word in potential_attribute_words if word not in object_type_words]
+    else:
+        # If no specific object type found, consider all non-stop words as potential attributes/keywords
+        attributes = potential_attribute_words
+
+    # Basic cleanup of attributes (e.g. remove very short words, duplicates)
+    attributes = sorted(list(set(attr for attr in attributes if len(attr) > 1))) # len > 1 might be too aggressive, consider len > 2 for some cases or specific removal
+    
+    logger.debug(f"Extracted from query '{query}': Type='{primary_object_type}', Attributes={attributes}")
+    return {"primary_object_type": primary_object_type, "primary_attributes": attributes}
+
 BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-large"
 
 try:
@@ -195,8 +318,87 @@ def merge_and_dedupe_products(products_list1: List[Dict], products_list2: List[D
 
 @app.route('/api/query', methods=['POST'])
 def query_route():
+    global last_search_context # Declare intent to read and modify global context here
     start_time = time.time()
     app.logger.info("Received API query request")
+
+    # --- Contextual Query Handling ---
+    user_prompt_for_context_check = request.form.get('prompt', '').lower()
+    original_user_prompt = request.form.get('prompt', '') # Keep original case for later use
+    is_contextual_query = False
+    contextual_search_query_for_apis = None
+
+    if last_search_context and user_prompt_for_context_check:
+        app.logger.debug(f"Checking for contextual reference in prompt: '{user_prompt_for_context_check}'")
+        app.logger.debug(f"Current last_search_context: {last_search_context}")
+        
+        found_ref_keyword = None
+        # Check if any keyword is a substring of the prompt, to catch phrases more flexibly
+        for ref_keyword in sorted(list(CONTEXTUAL_REFERENCE_KEYWORDS), key=len, reverse=True): # Check longer keywords first
+            if ref_keyword in user_prompt_for_context_check:
+                found_ref_keyword = ref_keyword
+                app.logger.debug(f"Found contextual keyword: '{found_ref_keyword}' in prompt: '{user_prompt_for_context_check}'")
+                break
+        
+        if found_ref_keyword:
+            app.logger.info(f"Contextual reference detected ('{found_ref_keyword}'). Trying to apply last search context.")
+            is_contextual_query = True
+            
+            # Try to parse a new item type from the current prompt
+            new_item_type = parse_new_item_type_from_prompt(user_prompt_for_context_check, KNOWN_OBJECT_TYPES)
+            
+            # Get attributes from last search (e.g., color)
+            last_primary_attributes = last_search_context.get("primary_attributes", [])
+            last_object_type = last_search_context.get("primary_object_type")
+            
+            query_parts = []
+            # Check if the reference is specifically about color
+            is_color_reference = any(c_ref in found_ref_keyword for c_ref in ["color", "colour"])
+            if not is_color_reference: # Also check the broader prompt text if keyword itself wasn't specific enough
+                is_color_reference = any(c_ref in user_prompt_for_context_check for c_ref in ["color", "colour"])
+
+            if is_color_reference:
+                app.logger.info("Contextual query is color-focused. Prioritizing color attributes from last search.")
+                # Extract only common color words from the last primary attributes
+                extracted_colors = [attr for attr in last_primary_attributes if attr in COMMON_COLORS]
+                if extracted_colors:
+                    query_parts.extend(extracted_colors)
+                    app.logger.info(f"Using specific colors from last context: {extracted_colors}")
+                else:
+                    # If no common colors found in attributes, but it was a color reference,
+                    # perhaps don't add any attributes or add a generic one if that makes sense.
+                    # For now, we'll be conservative and not add non-specific attributes if specific colors were asked for but not found.
+                    app.logger.info("Color reference made, but no common colors found in last_primary_attributes. Not adding color attributes to query.")
+            elif last_primary_attributes: # Not a specific color reference, but there are previous attributes
+                # Use non-stop-word attributes from last search, could be style, material etc.
+                # We might want to be even more selective here in future (e.g. exclude a wider range of generic nouns/verbs)
+                attributes_to_carry = [attr for attr in last_primary_attributes if attr not in COMMON_STOP_WORDS and attr not in COMMON_COLORS]
+                # If there are too many attributes, prioritize (e.g. first N, or based on POS tagging - advanced)
+                # For now, take a few if many are present
+                if len(attributes_to_carry) > 3: # Heuristic: limit carried-over non-color attributes
+                    app.logger.info(f"Too many non-color attributes from last context ({attributes_to_carry}), consider refining selection. Using first 3 for now.")
+                    query_parts.extend(attributes_to_carry[:3]) 
+                else:
+                    query_parts.extend(attributes_to_carry)
+                app.logger.info(f"Using general attributes from last context: {query_parts}")
+            
+            if new_item_type:
+                query_parts.append(new_item_type)
+                app.logger.info(f"Identified new item type for contextual query: '{new_item_type}'")
+            elif last_object_type: # If no new type but there was an old one, re-use old one with new attributes implicitly
+                query_parts.append(last_object_type)
+                app.logger.info(f"No new item type, re-using last object type: '{last_object_type}'")
+            
+            if query_parts:
+                contextual_search_query_for_apis = " ".join(query_parts)
+                app.logger.info(f"Constructed contextual search query: '{contextual_search_query_for_apis}'")
+            else:
+                app.logger.warning("Could not construct a meaningful contextual query. Falling back.")
+                is_contextual_query = False # Reset flag
+        else:
+            app.logger.debug("No contextual reference keyword found in prompt.")
+    # --- End Contextual Query Handling ---
+
     if 'image' not in request.files:
         app.logger.error("No image file in request")
         return jsonify({'error': 'No image file provided'}), 400
@@ -223,6 +425,11 @@ def query_route():
 
     # --- Category Hint Generation (Simple Heuristic) ---
     category_search_term: Optional[str] = None
+    # If it was a contextual query that successfully generated a search term, 
+    # we might not need image tags as much, or could use them as secondary.
+    # For now, image processing still happens for category_search_term generation regardless.
+    blip_caption: Optional[str] = None # Define blip_caption here to ensure it's in scope for context update
+
     if embedding_service:
         tag_gen_start_time = time.time()
         try:
@@ -242,23 +449,44 @@ def query_route():
     search_query_for_apis: str
     query_generation_start_time = time.time()
 
-    if prompt:
-        app.logger.info(f"User provided prompt: '{prompt}'. Using it to generate search query.")
+    # Use original_user_prompt for processing now, not the lowercased version
+    prompt = original_user_prompt 
+
+    if is_contextual_query and contextual_search_query_for_apis:
+        app.logger.info(f"Using contextual query for APIs: '{contextual_search_query_for_apis}'")
+        search_query_for_apis = contextual_search_query_for_apis
+        # The user's original prompt (which was contextual) is still passed to refinement service later.
+    elif prompt:
+        app.logger.info(f"User provided prompt: '{prompt}'. Using it to generate search query for APIs.")
         search_query_for_apis = refinement_service.generate_shopping_query(prompt)
-        app.logger.info(f"LLM generated search query from prompt: {search_query_for_apis} in {time.time() - query_generation_start_time:.2f}s")
-    elif blip_model and blip_processor:
-        app.logger.info("No user prompt. Generating image caption with BLIP.")
+        app.logger.info(f"LLM generated search_query_for_apis from user prompt: {search_query_for_apis} in {time.time() - query_generation_start_time:.2f}s")
+        # Note: blip_caption might still be generated if an image is present, for context storage, but not for API query if prompt is given.
+        # We need to decide if BLIP caption should be generated even when prompt is primary.
+        # For now, let's assume if prompt is given, search_query_for_apis is SOLELY from prompt.
+        # We still need blip_caption for last_search_context if no prompt was given for THAT turn.
+        # If an image is present with a prompt, we can still generate blip_caption for potential future reference or just to have it.
+        if blip_model and blip_processor: # Generate blip_caption if model available, even if prompt is used for main query
+            blip_start_time_prompt = time.time()
+            inputs_prompt = blip_processor(images=img_pil, return_tensors="pt")
+            out_prompt = blip_model.generate(**inputs_prompt, max_new_tokens=50)
+            caption_temp = blip_processor.decode(out_prompt[0], skip_special_tokens=True)
+            blip_caption = caption_temp # Store it in the broader scope variable
+            app.logger.info(f"BLIP caption (generated alongside prompt-based query): '{blip_caption}' in {time.time() - blip_start_time_prompt:.2f}s")
+
+    elif blip_model and blip_processor: # This case: No contextual query, NO user prompt, so rely on BLIP
+        app.logger.info("No user prompt and not contextual. Generating image caption with BLIP for API query.")
         blip_start_time = time.time()
         inputs = blip_processor(images=img_pil, return_tensors="pt")
         out = blip_model.generate(**inputs, max_new_tokens=50)
         caption = blip_processor.decode(out[0], skip_special_tokens=True)
+        blip_caption = caption # Assign to the broader scope variable
         app.logger.info(f"BLIP caption: '{caption}' generated in {time.time() - blip_start_time:.2f}s")
         
         refine_blip_start_time = time.time()
-        search_query_for_apis = refinement_service.generate_shopping_query(caption)
-        app.logger.info(f"LLM generated search query from BLIP caption in {time.time() - refine_blip_start_time:.2f}s. Total query gen: {time.time() - query_generation_start_time:.2f}s")
+        search_query_for_apis = refinement_service.generate_shopping_query(caption) # Query from BLIP
+        app.logger.info(f"LLM generated search_query_for_apis from BLIP caption in {time.time() - refine_blip_start_time:.2f}s. Total query gen: {time.time() - query_generation_start_time:.2f}s")
     else:
-        app.logger.warning("BLIP model not available and no prompt. Using category hint as search query if available, else 'product'.")
+        app.logger.warning("No contextual query, no user prompt, and BLIP model not available. Using category hint or fallback for API query.")
         # Fallback: Use category hint if available, otherwise a generic term
         search_query_for_apis = category_search_term if category_search_term else 'product'
         if not category_search_term and embedding_service:
@@ -327,6 +555,8 @@ def query_route():
             app.logger.info(f"Refining up to {MAX_PRODUCTS_TO_REFINE} products using RefinementService.")
             # Construct a context string for refinement if needed by the LLM
             context_for_refinement = f"Original user prompt (if any): {prompt}. Image caption/tags generated: {search_query_for_apis}. Category hint used: {category_search_term if category_search_term else 'N/A'}."
+            if is_contextual_query: # Add more context if it was a contextual query
+                context_for_refinement = f"Contextual User Prompt: {prompt}. Search derived from context: '{search_query_for_apis}'. Image (if any) provided with this prompt. Last context was: {last_search_context}. Category hint: {category_search_term if category_search_term else 'N/A'}."
             
             refined_products = refinement_service.refine_results(
                 context_for_refinement,
@@ -348,7 +578,27 @@ def query_route():
     processing_time = time.time() - start_time
     app.logger.info(f"Total request processing time: {processing_time:.2f}s. Returning {len(refined_products)} products.")
     
-    # Ensure consistent response structure
+    # --- Update last_search_context (AFTER successful processing) ---
+    # Ensure blip_caption_value is defined correctly based on whether prompt was used
+    blip_caption_value = None
+    if not prompt and blip_caption: # Use the blip_caption variable defined in the broader scope
+        blip_caption_value = blip_caption
+        
+    if search_query_for_apis: # Ensure we have a query that was used for APIs
+        extracted_elements = extract_key_elements_from_query(search_query_for_apis)
+        last_search_context = {
+            "search_query_for_apis": search_query_for_apis,
+            "primary_object_type": extracted_elements.get("primary_object_type"),
+            "primary_attributes": extracted_elements.get("primary_attributes", []),
+            "image_tags_hint": category_search_term, # The one used for category search if any
+            "user_prompt_at_time": prompt, # Original user prompt for this search
+            "blip_caption_at_time": blip_caption_value # BLIP caption if used
+        }
+        app.logger.info(f"Updated last_search_context: {last_search_context}")
+    else:
+        app.logger.warning("Skipping update to last_search_context as search_query_for_apis was empty.")
+    # --- End Update last_search_context ---
+    
     return jsonify({
         'products': refined_products,
         'search_query_used': search_query_for_apis,
