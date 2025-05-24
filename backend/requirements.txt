@@ -1,0 +1,39 @@
+Flask==3.0.3
+flask-cors==4.0.0
+python-dotenv==1.0.1
+
+# Image Processing & Computer Vision
+pillow==10.3.0
+torch==2.3.0 # Or your CUDA-specific version e.g., torch==2.2.1+cu118
+transformers[torch]==4.41.1 # For BLIP and potentially other LLM tasks
+open_clip_torch==2.24.0 # For CLIP embeddings
+# faiss-cpu==1.7.4 # Or faiss-gpu if you have a compatible GPU and setup - UNCOMMENT
+
+# HTTP Requests
+requests==2.32.3 # Used by Amazon and RapidAPI e-commerce API services
+
+# Optional, but good for development
+ipython # For interactive debugging
+
+# Numerical operations
+numpy==1.26.4
+
+# Machine Learning Utilities
+scikit-learn==1.5.0
+
+# For RefinementService (LLM & NLP)
+langchain==0.1.20
+huggingface_hub==0.23.0
+spacy==3.7.5
+# Required by spacy model en_core_web_sm: python -m spacy download en_core_web_sm
+
+# For Langchain PydanticOutputParser
+pydantic==1.10.13 # Pinning to v1 as Langchain has issues with v2 sometimes
+
+# For Pillow image format support
+olefile==0.47
+
+# Note: Unwrangle and Flipkart SDKs are not explicitly added 
+# if using direct HTTP requests as implemented in the new services.
+# If official SDKs are preferred later, they should be added here.
+# For RapidAPI, direct HTTP calls with 'requests' is the typical approach. 
