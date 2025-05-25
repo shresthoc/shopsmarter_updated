@@ -7,8 +7,16 @@ gunicorn==21.2.0         # Production WSGI server
 python-dotenv==1.0.0
 
 # Image Processing & ML
-torch==2.2.0
-torchvision==0.17.0
+# Use CPU-only versions for smaller size on Vercel
+# torch==2.2.0
+# torchvision==0.17.0
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
+# Ensure versions are compatible if you need specific ones, e.g.:
+# torch==2.2.0+cpu
+# torchvision==0.17.0+cpu
+# For now, letting pip resolve compatible CPU versions
+
 open_clip_torch==2.23.0
 faiss-cpu==1.7.4
 Pillow==10.0.0
