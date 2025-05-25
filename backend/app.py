@@ -21,6 +21,24 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 # Get the backend directory path
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# --- Vercel Cache Configuration ---
+VERCEL_ENV = os.environ.get("VERCEL") == "1"
+MODEL_CACHE_ROOT_DIR = "/tmp/model_cache" # Root for all model caches on Vercel
+
+if VERCEL_ENV:
+    os.makedirs(MODEL_CACHE_ROOT_DIR, exist_ok=True)
+    # Set Hugging Face cache environment variables
+    os.environ['HF_HOME'] = os.path.join(MODEL_CACHE_ROOT_DIR, 'huggingface')
+    os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(MODEL_CACHE_ROOT_DIR, 'huggingface')
+    # Set PyTorch Hub cache environment variable (used by open_clip and others)
+    os.environ['TORCH_HOME'] = os.path.join(MODEL_CACHE_ROOT_DIR, 'pytorch')
+    # Ensure subdirectories exist
+    os.makedirs(os.environ['HF_HOME'], exist_ok=True)
+    os.makedirs(os.environ['TORCH_HOME'], exist_ok=True)
+    print(f"[Vercel Init] HF_HOME set to: {os.environ['HF_HOME']}")
+    print(f"[Vercel Init] TORCH_HOME set to: {os.environ['TORCH_HOME']}")
+# --- End Vercel Cache Configuration ---
+
 # Load environment variables before anything else
 load_dotenv()
 
@@ -248,8 +266,14 @@ try:
 
     # Load BLIP model for captioning
     logger.info(f"Loading BLIP model: {BLIP_MODEL_NAME}")
-    blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
-    blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME)
+    blip_cache_subdir = None
+    if VERCEL_ENV:
+        blip_cache_subdir = os.path.join(os.environ['HF_HOME'], 'blip') # Specific subdir for BLIP
+        os.makedirs(blip_cache_subdir, exist_ok=True)
+        print(f"[Vercel BLIP Load] BLIP model cache directory: {blip_cache_subdir}")
+
+    blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME, cache_dir=blip_cache_subdir)
+    blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME, cache_dir=blip_cache_subdir)
     logger.info("BLIP model loaded successfully.")
     
     logger.info('All services and models initialized successfully')
