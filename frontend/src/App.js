@@ -15,6 +15,7 @@ function App() {
   const [inputValue, setInputValue] = useState(''); // For chat input
   const [messages, setMessages] = useState([]);
   const [cart, setCart] = useState([]);
+  const [isCartOpen, setIsCartOpen] = useState(false);
   const messagesEndRef = useRef(null); // To scroll to the bottom of messages
 
   const scrollToBottom = () => {
@@ -160,6 +161,25 @@ function App() {
     setMessages(prev => [...prev, cartMessage]);
   };
 
+  const handleAddToCart = (product) => {
+    setCart((prevCart) => {
+      // Avoid adding duplicates
+      if (prevCart.find(item => item.id === product.id)) {
+        return prevCart;
+      }
+      return [...prevCart, product];
+    });
+  };
+
+  const handleCartClick = () => {
+    // Instead of an alert, we'll open a modal
+    setIsCartOpen(true);
+  };
+
+  const closeCartModal = () => {
+    setIsCartOpen(false);
+  }
+
   // Basic ChatBubble component
   const ChatBubble = ({ from, children, image }) => (
     <div className={`chat-bubble ${from}`}>
@@ -217,10 +237,33 @@ function App() {
     <div className="App">
       <header className="App-header">
         <h1>ShopSmarter AI Chat</h1>
-        <div className="cart-icon" onClick={() => alert(`Cart items: ${cart.length}. Detailed cart view TBD.`)}>
-          🛒 <span className="cart-count">{cart.length}</span>
+        <div className="cart-icon" onClick={handleCartClick}>
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="9" cy="21" r="1"></circle><circle cx="20" cy="21" r="1"></circle><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path></svg>
+          {cart.length > 0 && <span className="cart-count">{cart.length}</span>}
         </div>
       </header>
+
+      {isCartOpen && (
+        <div className="cart-modal-overlay">
+          <div className="cart-modal">
+            <div className="cart-modal-header">
+              <h2>Your Cart</h2>
+              <button onClick={closeCartModal} className="close-cart-btn">&times;</button>
+            </div>
+            <div className="cart-modal-body">
+              {cart.length > 0 ? (
+                <div className="product-list-cart">
+                  {cart.map((product) => (
+                    <ProductCard key={product.id} product={product} onAddToCart={() => {}} />
+                  ))}
+                </div>
+              ) : (
+                <p>Your cart is empty.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="chat-container">
         <div className="message-list">
