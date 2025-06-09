@@ -17,9 +17,11 @@ torchvision --index-url https://download.pytorch.org/whl/cpu
 # torchvision==0.17.0+cpu
 # For now, letting pip resolve compatible CPU versions
 
-open_clip_torch==2.23.0
+# open_clip_torch==2.23.0 # This will be replaced by transformers for CLIP
 faiss-cpu==1.7.4
 Pillow==10.0.0
+sentence-transformers==0.4.1.2 # Or a more recent version
+accelerate==0.25.0 # Or a more recent version
 
 # Web Scraping
 requests==2.31.0
@@ -32,8 +34,9 @@ webdriver-manager==4.0.0
 # Note: you'll need to install the model with:
 #    python -m spacy download en_core_web_sm
 langchain==0.0.300
-transformers==4.33.1
-pydantic==2.6.0
+transformers==4.35.2 # Using a specific version
+pydantic==2.6.0 # Ensure this is compatible with Langchain/Transformers if issues arise
+llama-cpp-python # Added as requested
 
 # Utilities
 numpy==1.24.3

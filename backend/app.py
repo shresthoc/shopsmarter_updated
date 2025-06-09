@@ -52,15 +52,7 @@ logger.info('Environment variables loaded')
 
 # Initialize Flask app
 app = Flask(__name__)
-# Enable CORS for all routes with more permissive settings
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:3000"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Accept"],
-        "supports_credentials": True
-    }
-})
+CORS(app, resources={r"/api/*": {"origins": "*"}}) # Simplified CORS for API routes
 logger.info('Flask app initialized with CORS')
 
 @app.after_request
@@ -73,7 +65,7 @@ def after_request(response):
 
 # Import services with correct names
 from services.embed_and_search import EmbeddingService
-from services.refine_with_llm import RefinementService
+from services.refinement_service import RefinementService
 # Replace single RapidApiEcomService with specific Amazon and Flipkart RapidAPI services
 # from services.rapidapi_ecom import RapidApiEcomService # REMOVED
 from services.base_rapidapi_service import BaseRapidApiService
@@ -92,43 +84,37 @@ rapidapi_flipkart_service: Optional[BaseRapidApiService] = None # RE-ADDED for F
 blip_processor: Optional[BlipProcessor] = None
 blip_model: Optional[BlipForConditionalGeneration] = None
 
-# Stores details from the last successful search to provide conversational context
-last_search_context: Dict = {}
+# --- Global State & Configuration ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# This will hold the context of the last successful search (for follow-up questions)
+last_search_context = {}
 
 # Known common object types for simple parsing
-KNOWN_OBJECT_TYPES = {
-    'shirt', 't-shirt', 'jacket', 'dress', 'pants', 'shoes', 'top', 'blouse', 'skirt', 'jeans', 'sweater', 'coat',
-    'shirts', 't-shirts', 'jackets', 'dresses', 'shoe', 'tops', 'blouses', 'skirts', 'sweaters', 'coats' # Added plurals & shoe singular
-}
+KNOWN_OBJECT_TYPES = {"shirt", "t-shirt", "tshirt", "jeans", "pants", "shoes", "jacket", "dress", "skirt", "shorts"}
 COMMON_STOP_WORDS = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'on', 'in', 'at', 'to', 'for', 'with', 'of', 'by', 'and', 'or', 'but', 'it', 'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our', 'their', 'men', "men's", 'womens', "women's", 'lady', "lady's"} # Added some common gendered words that are often not core attributes
 COMMON_COLORS = {"red", "blue", "green", "yellow", "black", "white", "pink", "purple", "orange", "brown", "gray", "grey", "beige", "navy", "teal", "maroon", "olive", "silver", "gold"}
 
-# Keywords indicating a reference to the last search context
+# Keywords that indicate the user is referring to the last search result
 CONTEXTUAL_REFERENCE_KEYWORDS = {
-    # General references to previous item
-    "last item", "previous item", "last one", "that one", 
-    "similar to last", "like the last", "like that",
-    
-    # References to attributes of the last item
-    "that color", "that colour", "its color", "its colour",
-    "same color", "same colour", "in that color", "in that colour",
-    "in the color of", "in the colour of", # More flexible
-    "color of last", "colour of last",
-    
-    # References to type of last item (will also be covered by loop below but good to have common ones)
-    "last t-shirt", "last shirt", "last jacket", "last dress",
-    
-    # General similarity
-    "similar to that",
+    "it", "them", "they", "those", "these", 
+    "another", "other", "others", "one", "ones",
+    "in another color", "in a different color", "in another colour",
+    "how about", "what about", "show me", "find me"
 }
 
-# Add more specific item references and phrases like "... of the last [item_type]"
-for item_type in KNOWN_OBJECT_TYPES:
-    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"last {item_type}")
-    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"the last {item_type}") # Handles "...of the last tshirt"
-    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"previous {item_type}")
-    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"color of the last {item_type}")
-    CONTEXTUAL_REFERENCE_KEYWORDS.add(f"colour of the last {item_type}")
+# Prompts that are too generic to be useful for API search when an image is provided
+GENERIC_PROMPTS = {
+    "show similar products",
+    "find similar items",
+    "show me more like this",
+    "anything like this",
+    "show such similar products",
+    "search",
+    "find",
+    "get products"
+}
 
 def parse_new_item_type_from_prompt(prompt_text: str, known_types: set) -> Optional[str]:
     """Tries to find a new explicit item type in a contextual prompt."""
@@ -301,354 +287,231 @@ def allowed_file(filename: str) -> bool:
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def merge_and_dedupe_products(products_list1: List[Dict], products_list2: List[Dict]) -> List[Dict]: # UPDATED: Takes two lists again
-    """
-    Merges two lists of products and dedupulicates them based on title and image_url.
-    """
-    combined_products = products_list1 + products_list2 # REINSTATED: Combining two lists here
-    logger.debug(f"Starting dedupe for {len(combined_products)} products (from {len(products_list1)} + {len(products_list2)})." )
-    
-    seen_products = set()
-    deduped_list = []
-    
-    for product in combined_products: # Iterate over the combined list
-        # Create a unique key for deduplication, prefer non-None titles and image_urls
-        title = product.get("title", "") or ""
-        image_url = product.get("image_url", "") or ""
-        
-        # Normalize by lowercasing and removing simple punctuation/whitespace for better matching
-        # This is a basic normalization. More sophisticated methods could be used.
-        normalized_title = "".join(filter(str.isalnum, title.lower()))
-        
-        # Use a tuple of (normalized_title_prefix, image_url) as a key.
-        # Using a prefix of title can help catch near-duplicates if full titles vary slightly.
-        # Image URL is a strong signal for uniqueness if available.
-        # If image_url is not available, rely more on title.
-        key_title_part = normalized_title[:50] # Use first 50 chars of normalized title
+def merge_and_dedupe_products(products_list1: List[Dict], products_list2: List[Dict]) -> List[Dict]:
+    """Merges two lists of product dictionaries and removes duplicates based on product 'id' or (if unavailable) 'photo_url'."""
+    if not products_list1:
+        return products_list2 or []
+    if not products_list2:
+        return products_list1 or []
 
-        if image_url:
-            product_key = (key_title_part, image_url)
-        else: # Fallback if no image_url, rely on title more heavily (less reliable for dedupe)
-            product_key = (key_title_part,)
+    # Use a dictionary for efficient deduplication
+    merged_products: Dict[str, Dict] = {}
 
-        if product_key not in seen_products:
-            seen_products.add(product_key)
-            deduped_list.append(product)
-        else:
-            logger.debug(f"Duplicate product skipped: Title '{title}', Image '{image_url}'")
-            
-    logger.debug(f"Finished dedupe. Original combined: {len(combined_products)}, Deduped: {len(deduped_list)}")
-    return deduped_list
+    # Combine lists, giving priority to the first list
+    combined = products_list1 + products_list2
+
+    for product in combined:
+        # Use a tuple of ('id', value) or ('photo', value) as key
+        key = None
+        if product.get('id'):
+            key = ('id', product.get('id'))
+        elif product.get('photo_url'):
+            key = ('photo', product.get('photo_url'))
+        
+        # If a key was determined and it's not already in our dict, add it.
+        if key and key not in merged_products:
+            merged_products[key] = product
+
+    logger.info(f"Merged {len(products_list1)} and {len(products_list2)} product lists into {len(merged_products)} unique products.")
+    return list(merged_products.values())
 
 @app.route('/api/query', methods=['POST'])
-def query_route():
-    start_time_total = time.time()
-    logger.info("Received API query request")
-    
-    image_file = request.files.get('image')
-    prompt_text = request.form.get('prompt', '')
-    use_context = request.form.get('use_context', 'false').lower() == 'true'
-    
-    image_path = None
-    image_tags_hint = None # For category search via RapidAPI
-    blip_caption_for_query = None # For text search via RapidAPI if no prompt
+def query():
+    """Handles user queries, both with and without images."""
+    global last_search_context # Required to modify the global variable within this function
 
-    if image_file and allowed_file(image_file.filename):
-        start_time_save = time.time()
-        filename = secure_filename(image_file.filename)
-        # Use /tmp directory for Vercel compatibility
-        temp_dir = "/tmp" 
-        if not os.path.exists(temp_dir):
-            try:
-                os.makedirs(temp_dir) # Should not be strictly necessary on Vercel /tmp but good practice
-            except OSError as e:
-                logger.error(f"Error creating /tmp directory (should be unnecessary on Vercel): {e}")
-                # Fallback or error, though /tmp should exist and be writable
+    try:
+        if 'image' not in request.files and 'prompt' not in request.form:
+            return jsonify({"error": "No prompt or image provided."}), 400
         
-        image_path = os.path.join(temp_dir, filename)
-        try:
-            image_file.save(image_path)
-            logger.info(f"File saved to: {image_path} in {time.time() - start_time_save:.2f}s")
-
-            # Process image for tags (category hint) and BLIP caption (potential query)
-            start_time_img_proc = time.time()
-            try:
-                with Image.open(image_path) as img:
-                    img_rgb = img.convert('RGB') # Ensure image is in RGB for models
-                    
-                    # Get image tags for category hint
-                    if embedding_service:
-                        tags = embedding_service.get_image_tags(img_rgb, top_n=2) # Get top 2 tags
-                        if tags:
-                            image_tags_hint = " ".join(tags) 
-                            logger.info(f"Generated category hint from image tags: '{image_tags_hint}'")
-                    
-                    # Generate BLIP caption if no user prompt
-                    if not prompt_text and blip_model and blip_processor:
-                        inputs = blip_processor(images=img_rgb, return_tensors="pt")
-                        out = blip_model.generate(**inputs, max_length=75) # Increased max_length for more descriptive captions
-                        blip_caption_for_query = blip_processor.decode(out[0], skip_special_tokens=True)
-                        logger.info(f"BLIP caption: '{blip_caption_for_query}' generated")
-
-                logger.info(f"Image opened and processed (tags/BLIP) in {time.time() - start_time_img_proc:.2f}s")
-            except Exception as e:
-                logger.error(f"Error processing image {image_path} for tags/BLIP: {e}\n{traceback.format_exc()}")
-        except Exception as e:
-            logger.error(f"Error saving file {filename} to {temp_dir}: {e}\n{traceback.format_exc()}")
-            image_path = None # Ensure image_path is None if save fails
-
-    # --- Contextual Query Handling ---
-    user_prompt_for_context_check = prompt_text.lower()
-    original_user_prompt = prompt_text # Keep original case for later use
-    is_contextual_query = False
-    contextual_search_query_for_apis = None
-
-    if last_search_context and user_prompt_for_context_check:
-        logger.debug(f"Checking for contextual reference in prompt: '{user_prompt_for_context_check}'")
-        logger.debug(f"Current last_search_context: {last_search_context}")
+        prompt = request.form.get('prompt', '').strip()
+        image_file = request.files.get('image')
         
-        found_ref_keyword = None
-        # Check if any keyword is a substring of the prompt, to catch phrases more flexibly
-        for ref_keyword in sorted(list(CONTEXTUAL_REFERENCE_KEYWORDS), key=len, reverse=True): # Check longer keywords first
-            if ref_keyword in user_prompt_for_context_check:
-                found_ref_keyword = ref_keyword
-                logger.debug(f"Found contextual keyword: '{found_ref_keyword}' in prompt: '{user_prompt_for_context_check}'")
-                break
-        
-        if found_ref_keyword:
-            logger.info(f"Contextual reference detected ('{found_ref_keyword}'). Trying to apply last search context.")
-            is_contextual_query = True
+        # --- 1. Image Processing (if an image is provided) ---
+        if image_file:
+            if not allowed_file(image_file.filename):
+                return jsonify({"error": "Invalid file type. Allowed types are png, jpg, jpeg, gif."}), 400
             
-            # Try to parse a new item type from the current prompt
-            new_item_type = parse_new_item_type_from_prompt(user_prompt_for_context_check, KNOWN_OBJECT_TYPES)
+            # Reset context if a new image is uploaded, as it's a new search.
+            last_search_context.clear()
             
-            # Get attributes from last search (e.g., color)
-            last_primary_attributes = last_search_context.get("primary_attributes", [])
-            last_object_type = last_search_context.get("primary_object_type")
-            
-            query_parts = []
-            # Check if the reference is specifically about color
-            is_color_reference = any(c_ref in found_ref_keyword for c_ref in ["color", "colour"])
-            if not is_color_reference: # Also check the broader prompt text if keyword itself wasn't specific enough
-                is_color_reference = any(c_ref in user_prompt_for_context_check for c_ref in ["color", "colour"])
+            # Read image data into memory once
+            image_data = image_file.read()
+            logger.info(f"Processing uploaded image: {image_file.filename} ({len(image_data)} bytes)")
 
-            if is_color_reference:
-                logger.info("Contextual query is color-focused. Prioritizing color attributes from last search.")
-                # Extract only common color words from the last primary attributes
-                extracted_colors = [attr for attr in last_primary_attributes if attr in COMMON_COLORS]
-                if extracted_colors:
-                    query_parts.extend(extracted_colors)
-                    logger.info(f"Using specific colors from last context: {extracted_colors}")
-                else:
-                    # If no common colors found in attributes, but it was a color reference,
-                    # perhaps don't add any attributes or add a generic one if that makes sense.
-                    # For now, we'll be conservative and not add non-specific attributes if specific colors were asked for but not found.
-                    logger.info("Color reference made, but no common colors found in last_primary_attributes. Not adding color attributes to query.")
-            elif last_primary_attributes: # Not a specific color reference, but there are previous attributes
-                # Use non-stop-word attributes from last search, could be style, material etc.
-                # We might want to be even more selective here in future (e.g. exclude a wider range of generic nouns/verbs)
-                attributes_to_carry = [attr for attr in last_primary_attributes if attr not in COMMON_STOP_WORDS and attr not in COMMON_COLORS]
-                # If there are too many attributes, prioritize (e.g. first N, or based on POS tagging - advanced)
-                # For now, take a few if many are present
-                if len(attributes_to_carry) > 3: # Heuristic: limit carried-over non-color attributes
-                    logger.info(f"Too many non-color attributes from last context ({attributes_to_carry}), consider refining selection. Using first 3 for now.")
-                    query_parts.extend(attributes_to_carry[:3]) 
-                else:
-                    query_parts.extend(attributes_to_carry)
-                logger.info(f"Using general attributes from last context: {query_parts}")
+            # Get features (and the loaded image object)
+            image_object, image_features = embedding_service.get_features_for_image(image_data)
             
-            if new_item_type:
-                query_parts.append(new_item_type)
-                logger.info(f"Identified new item type for contextual query: '{new_item_type}'")
-            elif last_object_type: # If no new type but there was an old one, re-use old one with new attributes implicitly
-                query_parts.append(last_object_type)
-                logger.info(f"No new item type, re-using last object type: '{last_object_type}'")
-            
-            if query_parts:
-                contextual_search_query_for_apis = " ".join(query_parts)
-                logger.info(f"Constructed contextual search query: '{contextual_search_query_for_apis}'")
+            if image_features:
+                generated_caption = image_features.get('caption')
+                generated_tags = image_features.get('tags')
+
+                # If we have tags from the image and the user's prompt is generic or empty,
+                # prioritize the tags for a more specific initial search.
+                if generated_tags and (not prompt or prompt.lower().strip() in GENERIC_PROMPTS):
+                    # Combine the most relevant tags to form a search query.
+                    initial_search_term = " ".join(generated_tags[:3])
+                elif not prompt and generated_caption:
+                    # If there are no tags and no prompt, fall back to the caption.
+                    initial_search_term = generated_caption
+
+                logger.info(f"Image features extracted. Caption: '{generated_caption}'. Tags: {generated_tags}. Using '{initial_search_term}' for API search.")
             else:
-                logger.warning("Could not construct a meaningful contextual query. Falling back.")
-                is_contextual_query = False # Reset flag
-        else:
-            logger.debug("No contextual reference keyword found in prompt.")
-    # --- End Contextual Query Handling ---
-
-    search_query_for_apis: str
-    query_generation_start_time = time.time()
-
-    # Use original_user_prompt for processing now, not the lowercased version
-    prompt = original_user_prompt 
-
-    if is_contextual_query and contextual_search_query_for_apis:
-        logger.info(f"Using contextual query for APIs: '{contextual_search_query_for_apis}'")
-        search_query_for_apis = contextual_search_query_for_apis
-        # The user's original prompt (which was contextual) is still passed to refinement service later.
-    elif prompt:
-        logger.info(f"User provided prompt: '{prompt}'. Using it to generate search query for APIs.")
-        search_query_for_apis = refinement_service.generate_shopping_query(prompt)
-        logger.info(f"LLM generated search_query_for_apis from user prompt: {search_query_for_apis} in {time.time() - query_generation_start_time:.2f}s")
-        # Note: blip_caption might still be generated if an image is present, for context storage, but not for API query if prompt is given.
-        # We need to decide if BLIP caption should be generated even when prompt is primary.
-        # For now, let's assume if prompt is given, search_query_for_apis is SOLELY from prompt.
-        # We still need blip_caption for last_search_context if no prompt was given for THAT turn.
-        # If an image is present with a prompt, we can still generate blip_caption for potential future reference or just to have it.
-        if blip_model and blip_processor: # Generate blip_caption if model available, even if prompt is used for main query
-            blip_start_time_prompt = time.time()
-            inputs_prompt = blip_processor(images=img_rgb, return_tensors="pt")
-            out_prompt = blip_model.generate(**inputs_prompt, max_new_tokens=50)
-            caption_temp = blip_processor.decode(out_prompt[0], skip_special_tokens=True)
-            blip_caption_for_query = caption_temp # Store it in the broader scope variable
-            logger.info(f"BLIP caption (generated alongside prompt-based query): '{blip_caption_for_query}' in {time.time() - blip_start_time_prompt:.2f}s")
-
-    elif blip_model and blip_processor: # This case: No contextual query, NO user prompt, so rely on BLIP
-        logger.info("No user prompt and not contextual. Generating image caption with BLIP for API query.")
-        blip_start_time = time.time()
-        inputs = blip_processor(images=img_rgb, return_tensors="pt")
-        out = blip_model.generate(**inputs, max_new_tokens=50)
-        caption = blip_processor.decode(out[0], skip_special_tokens=True)
-        blip_caption_for_query = caption # Assign to the broader scope variable
-        logger.info(f"BLIP caption: '{caption}' generated in {time.time() - blip_start_time:.2f}s")
-        
-        refine_blip_start_time = time.time()
-        search_query_for_apis = refinement_service.generate_shopping_query(caption) # Query from BLIP
-        logger.info(f"LLM generated search_query_for_apis from BLIP caption in {time.time() - refine_blip_start_time:.2f}s. Total query gen: {time.time() - query_generation_start_time:.2f}s")
-    else:
-        logger.warning("No contextual query, no user prompt, and BLIP model not available. Using category hint or fallback for API query.")
-        # Fallback: Use category hint if available, otherwise a generic term
-        search_query_for_apis = image_tags_hint if image_tags_hint else 'product'
-        if not image_tags_hint and embedding_service:
-             # If no category hint from tags but embedding service is there, try to get at least one tag as a last resort for query
-            try:
-                tags_fallback = embedding_service.get_image_tags(img_rgb, top_k=1)
-                if tags_fallback: search_query_for_apis = tags_fallback[0]
-            except Exception: pass # Ignore if this fails, use 'product'
-        logger.info(f"Fallback search query: {search_query_for_apis} in {time.time() - query_generation_start_time:.2f}s")
-
-    api_call_start_time = time.time()
-    # all_raw_products: List[Dict] = [] # REMOVED: We will have separate lists
-    amazon_products: List[Dict] = []
-    flipkart_products: List[Dict] = []
-
-    # REMOVE Single call to the unified product search service
-    # if product_search_service: 
-    #    ...
-    # else:
-    #    logger.warning("UnifiedProductSearch service (BaseRapidApiService) not initialized. Skipping product search.")
-
-    # ADDED: Calls to separate Amazon and Flipkart services
-    if rapidapi_amazon_service:
-        logger.info(f"Calling RapidAPI-Amazon Service with query: '{search_query_for_apis}', category hint: '{image_tags_hint if image_tags_hint else 'N/A'}'")
-        # Amazon /search uses text query primarily; category_search_term might be ignored if not configured for this specific API endpoint.
-        amazon_products = rapidapi_amazon_service.search_products(
-            query=search_query_for_apis,
-            limit=15, 
-            category_search_term=image_tags_hint
-        )
-        logger.info(f"RapidAPI-Amazon Service returned {len(amazon_products)} products.")
-    else:
-        logger.warning("RapidAPI-Amazon service not initialized. Skipping Amazon product search.")
-
-    if rapidapi_flipkart_service:
-        logger.info(f"Calling RapidAPI-Flipkart Service with category: '{image_tags_hint if image_tags_hint else 'N/A'}', text query hint: '{search_query_for_apis}'")
-        # Flipkart /products-by-category uses category_search_term primarily.
-        # search_query_for_apis will only be used if RAPIDAPI_FLIPKART_TEXT_QUERY_PARAM is set in .env.
-        flipkart_products = rapidapi_flipkart_service.search_products(
-            query=search_query_for_apis, 
-            limit=15,
-            category_search_term=image_tags_hint 
-        )
-        logger.info(f"RapidAPI-Flipkart Service returned {len(flipkart_products)} products.")
-    else:
-        logger.warning("RapidAPI-Flipkart service not initialized. Skipping Flipkart product search.")
-
-    logger.info(f"API calls completed in {time.time() - api_call_start_time:.2f}s")
-
-    merging_start_time = time.time()
-    # all_products = merge_and_dedupe_products(all_raw_products) # REMOVED
-    all_products = merge_and_dedupe_products(amazon_products, flipkart_products) # UPDATED: Pass the two lists
-    logger.info(f"Merged and deduped products in {time.time() - merging_start_time:.2f}s. Total products: {len(all_products)}")
-
-    # Optional: Rerank based on CLIP similarity (if embedding_service is available and products have image_url)
-    # This requires products to have 'image_url' and embedding_service to be functional
-    # For now, we'll just use the order from the API after deduplication.
-
-    final_refinement_start_time = time.time()
-    MAX_PRODUCTS_TO_REFINE = int(os.getenv('MAX_PRODUCTS_TO_REFINE', 10)) # Default to 10
-    refined_products = []
-
-    if refinement_service:
-        # Only refine if there are products and a refinement service
-        if all_products:
-            logger.info(f"Refining up to {MAX_PRODUCTS_TO_REFINE} products using RefinementService.")
-            # Construct a context string for refinement if needed by the LLM
-            context_for_refinement = f"Original user prompt (if any): {prompt}. Image caption/tags generated: {search_query_for_apis}. Category hint used: {image_tags_hint if image_tags_hint else 'N/A'}."
-            if is_contextual_query: # Add more context if it was a contextual query
-                context_for_refinement = f"Contextual User Prompt: {prompt}. Search derived from context: '{search_query_for_apis}'. Image (if any) provided with this prompt. Last context was: {last_search_context}. Category hint: {image_tags_hint if image_tags_hint else 'N/A'}."
+                return jsonify({"error": f"Failed to process image: {image_file.filename}. It may be corrupt."}), 500
+        # --- 1b. Contextual Search Logic (No Image) ---
+        else: # No image provided, this could be a follow-up query
+            is_contextual_query = any(keyword in prompt.lower() for keyword in CONTEXTUAL_REFERENCE_KEYWORDS)
             
-            refined_products = refinement_service.refine_results(
-                context_for_refinement,
-                all_products[:MAX_PRODUCTS_TO_REFINE]
-            )
-            logger.info(f"RefinementService processed {len(refined_products)} products in {time.time() - final_refinement_start_time:.2f}s")
-        else:
-            logger.info("No products to refine.")
-            refined_products = []
-    else:
-        logger.warning("RefinementService not available. Using products as is (up to MAX_PRODUCTS_TO_REFINE).")
-        refined_products = all_products[:MAX_PRODUCTS_TO_REFINE] # Fallback: just take top N
+            if is_contextual_query and last_search_context.get('primary_object_type'):
+                logger.info(f"Contextual query detected. Last context: {last_search_context}")
+                
+                # Extract new details from the current prompt
+                new_elements = extract_key_elements_from_query(prompt)
+                new_attributes = new_elements.get('primary_attributes', [])
+                
+                # Did the user ask for a completely new type of item?
+                new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
+                
+                # Build the new search term
+                if new_item_type:
+                    # e.g., "how about a jacket" -> search for "blue jacket" if last was "blue shirt"
+                    final_attributes = list(set(last_search_context.get('primary_attributes', []) + new_attributes))
+                    initial_search_term = f"{' '.join(final_attributes)} {new_item_type}"
+                else:
+                    # e.g., "in blue" -> search for "blue shirt" if last was "red shirt"
+                    final_attributes = list(set(new_attributes))
+                    # If no new attributes, keep the old ones.
+                    if not final_attributes:
+                        final_attributes = last_search_context.get('primary_attributes', [])
+                    initial_search_term = f"{' '.join(final_attributes)} {last_search_context['primary_object_type']}"
+                
+                logger.info(f"Constructed new search term from context: '{initial_search_term}'")
+            else:
+                # Not a contextual query, or no context available. Treat as a new search.
+                last_search_context.clear() # Clear context
+                logger.info("No image and not a contextual query. Treating as a new search.")
 
-    # If refinement somehow failed or returned empty, but we had products, fallback to unrefined (deduped) list
-    if not refined_products and all_products:
-        logger.warning("Refinement returned empty list, but original products existed. Falling back to non-refined list (up to MAX_PRODUCTS_TO_REFINE).")
-        refined_products = all_products[:MAX_PRODUCTS_TO_REFINE]
-    
-    processing_time = time.time() - start_time_total
-    logger.info(f"Total request processing time: {processing_time:.2f}s. Returning {len(refined_products)} products.")
-    
-    # --- Update last_search_context (AFTER successful processing) ---
-    # Ensure blip_caption_value is defined correctly based on whether prompt was used
-    blip_caption_value = None
-    if not prompt and blip_caption_for_query: # Use the blip_caption variable defined in the broader scope
-        blip_caption_value = blip_caption_for_query
+        # --- 2. Initial Product Retrieval ---
+        # We need an initial set of products to work with, either for the LLM to refine
+        # or to populate our vector index for similarity search.
         
-    if search_query_for_apis: # Ensure we have a query that was used for APIs
-        extracted_elements = extract_key_elements_from_query(search_query_for_apis)
-        last_search_context = {
-            "search_query_for_apis": search_query_for_apis,
-            "primary_object_type": extracted_elements.get("primary_object_type"),
-            "primary_attributes": extracted_elements.get("primary_attributes", []),
-            "image_tags_hint": image_tags_hint, # The one used for category search if any
-            "user_prompt_at_time": prompt, # Original user prompt for this search
-            "blip_caption_at_time": blip_caption_value # BLIP caption if used
+        api_products = []
+        # Only perform an API search if we have a search term (from prompt or caption)
+        if initial_search_term:
+            logger.info(f"Performing initial product search on APIs with term: '{initial_search_term}'")
+            # For simplicity, let's just use the Amazon service for now. This can be expanded.
+            if rapidapi_amazon_service:
+                api_products = rapidapi_amazon_service.search(query=initial_search_term, country="IN")
+                logger.info(f"Found {len(api_products)} products from API search.")
+        
+        # --- 3. Vector Index Management ---
+        # If the index is empty, build it with the products we just got from the API.
+        if embedding_service.index.ntotal == 0:
+            if api_products:
+                logger.info("FAISS index is empty. Building index with products from API search.")
+                embedding_service.build_index(api_products)
+            else:
+                logger.warning("FAISS index is empty, but no API products were found to build it.")
+
+        # --- 4. Image Similarity Search ---
+        # If an image was provided, now we can perform the similarity search against the (now populated) index.
+        similar_products = []
+        if image_object:
+            logger.info(f"Finding similar products for the uploaded image...")
+            similar_products = embedding_service.find_similar(
+                query_image=image_object,
+                k=20 # Fetch more to allow for merging/deduping
+            )
+            logger.info(f"Found {len(similar_products)} candidates from image similarity search.")
+
+        # --- 5. Merge and Combine Results ---
+        # Combine the results from the initial API search and the similarity search.
+        # `merge_and_dedupe_products` prioritizes the first list, so we put the most relevant results first.
+        # If a similarity search was done, those results are likely more relevant.
+        if similar_products:
+            all_products = merge_and_dedupe_products(similar_products, api_products)
+        else:
+            all_products = api_products
+
+        if not all_products:
+            logger.info("No products found from any source.")
+            bot_message = {
+                "isBot": True,
+                "text": "I couldn't find any products matching your request. Could you try being more specific or upload a different image?",
+                "products": [],
+            }
+            return jsonify(bot_message)
+
+        # --- 6. LLM Refinement ---
+        final_products = all_products
+        # Only refine if the user provided a specific, non-generic text prompt.
+        if prompt and refinement_service and final_products:
+            # Check if we should skip refinement due to a generic prompt with an image
+            if image_file and prompt.lower().strip() in GENERIC_PROMPTS:
+                logger.info(f"Skipping LLM refinement because a generic prompt ('{prompt}') was used with an image.")
+                # The 'final_products' is already 'all_products', so no change needed.
+            else:
+                logger.info(f"Refining {len(all_products)} products with prompt: '{prompt}'")
+                refined_products = refinement_service.refine_results(all_products, prompt)
+                
+                # If refinement returns a valid (even if empty) list, use it.
+                # If it returns None (indicating an error), or an empty list when we had candidates, fall back.
+                if refined_products is not None and len(refined_products) > 0:
+                    logger.info(f"LLM refinement successful. Previous count: {len(all_products)}, New count: {len(refined_products)}.")
+                    final_products = refined_products
+                elif refined_products is not None and len(refined_products) == 0:
+                    logger.info("LLM refinement returned 0 products. Keeping original list.")
+                    # Keep final_products as all_products
+                else: # refined_products is None or something unexpected
+                    logger.warning("LLM refinement failed or returned an unexpected value. Falling back to pre-refinement list.")
+                    # Keep final_products as all_products
+
+        # --- 7. Final Response ---
+        # Store the key information from this search to be used as context for the next turn.
+        if final_products:
+            # For simplicity, context is based on the top result
+            top_result = final_products[0]
+            last_search_context = {
+                'primary_object_type': extract_key_elements_from_query(top_result.get('product_title', ''))['primary_object_type'],
+                'primary_attributes': extract_key_elements_from_query(top_result.get('product_title', ''))['primary_attributes'],
+                'product_id': top_result.get('product_id'),
+                'product_title': top_result.get('product_title')
+            }
+            logger.debug(f"Updated last_search_context: {last_search_context}")
+
+        bot_response = {
+            "isBot": True,
+            "text": f"Here are {len(final_products)} products I found based on your request.",
+            "products": final_products,
         }
-        logger.info(f"Updated last_search_context: {last_search_context}")
-    else:
-        logger.warning("Skipping update to last_search_context as search_query_for_apis was empty.")
-    # --- End Update last_search_context ---
-    
-    return jsonify({
-        'products': refined_products,
-        'search_query_used': search_query_for_apis,
-        'category_hint_used': image_tags_hint,
-        'processing_time_seconds': round(processing_time, 2),
-        'message': 'Query processed successfully.'
-    })
+        
+        # Prepend a contextual message if a caption was used.
+        if generated_caption and not prompt:
+             bot_response['text'] = f"Based on your image, which looks like a '{generated_caption}', I found these products."
+        
+        return jsonify(bot_response)
+
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred in /api/query: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint."""
-    return jsonify({'status': 'healthy', 'message': 'ShopSmarter backend is running.'}), 200
+    # Basic check
+    health_status = {"status": "ok", "services": {}}
+    
+    # Check services
+    health_status["services"]["embedding"] = "ok" if embedding_service else "unavailable"
+    health_status["services"]["refinement_llm"] = "ok" if refinement_service and refinement_service.model else "unavailable"
+    health_status["services"]["product_search"] = "ok" if product_search_service else "unavailable"
+    
+    is_healthy = all(status == "ok" for status in health_status["services"].values())
+    
+    return jsonify(health_status), 200 if is_healthy else 503
 
 if __name__ == '__main__':
-    # Ensure UPLOAD_FOLDER exists (it's also checked during app init, but good to double-check)
-    if not os.path.exists(UPLOAD_FOLDER):
-        try:
-            os.makedirs(UPLOAD_FOLDER)
-            app.logger.info(f"UPLOAD_FOLDER created at {UPLOAD_FOLDER} before app run.")
-        except Exception as e_mkdir:
-            app.logger.error(f"Could not create UPLOAD_FOLDER at {UPLOAD_FOLDER}: {e_mkdir}")
-            # Decide if this is fatal or if the app should attempt to run anyway
-            # For now, we'll let it try, as init also checks.
-
+    # Use a development server. For production, use a WSGI server like Gunicorn.
+    # Example: gunicorn --bind 0.0.0.0:5001 app:app
+    # The port should match what your frontend expects.
     app.run(debug=True, host='0.0.0.0', port=5001)
