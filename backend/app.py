@@ -104,6 +104,18 @@ CONTEXTUAL_REFERENCE_KEYWORDS = {
     "how about", "what about", "show me", "find me"
 }
 
+# Keywords for outfit building
+COORDINATION_KEYWORDS = {
+    # Core phrases
+    "go with", "goes with", "match", "matches", "matching", 
+    "style with", "pair with", "wear with", "look good with",
+    # Common variations
+    "go well with", "goes well with", "pairs well with",
+    "look great with", "works with", "work with",
+    # More explicit commands
+    "complete the look", "find a match for", "what to wear with"
+}
+
 # Prompts that are too generic to be useful for API search when an image is provided
 GENERIC_PROMPTS = {
     "show similar products",
@@ -326,6 +338,8 @@ def query():
         
         prompt = request.form.get('prompt', '').strip()
         image_file = request.files.get('image')
+        final_products = [] # Initialize for all paths to prevent UnboundLocalError
+        is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
         
         # --- 1. Image Processing (if an image is provided) ---
         if image_file:
@@ -345,180 +359,179 @@ def query():
                 generated_tags = embedding_service.get_image_tags(image_object)
                 generated_caption = embedding_service.generate_caption(image_object)
                 
-                # --- 1b. Determine the initial search term ---
-                initial_search_term = "" # Initialize to empty
+                # --- 1b. Determine the initial search term or trigger style builder ---
+                initial_search_term = "" 
                 
-                # A prompt was provided WITH an image. This is a powerful combination.
-                if prompt:
-                    # Check if the prompt is asking for a new item type while referencing the image's attributes (e.g., color).
+                # Scenario: Image + Coordination Prompt (e.g., "show me jeans that go with this")
+                if prompt and is_coordination_query:
                     new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
-                    
-                    if new_item_type:
-                        # User wants a new item type but in the style/color of the image.
-                        # We can use the image tags for attributes.
-                        # Example: Image of a "blue jeans", prompt is "show jackets in this colour" -> search for "blue jacket"
-                        # Extract attributes by taking tags that aren't also known item types.
-                        attributes = [tag for tag in generated_tags if tag not in KNOWN_OBJECT_TYPES and tag not in new_item_type]
-                        # We also want to extract color from the prompt itself, if present
-                        query_elements = extract_key_elements_from_query(prompt)
-                        attributes.extend(query_elements.get('primary_attributes', []))
+                    if new_item_type and refinement_service:
+                        # Build a description from the image tags
+                        base_item_attributes = [tag for tag in generated_tags if tag not in KNOWN_OBJECT_TYPES]
+                        base_item_type = next((tag for tag in generated_tags if tag in KNOWN_OBJECT_TYPES), "item")
+                        base_item_desc = f"{' '.join(base_item_attributes)} {base_item_type}".strip()
                         
-                        initial_search_term = f"{' '.join(list(set(attributes)))} {new_item_type}"
-                    else:
-                        # The prompt is likely a refinement on the item in the image, e.g., "a brighter red one"
-                        # For this, we can combine the prompt and the top tags.
-                        top_tags = ' '.join(generated_tags[:3])
-                        initial_search_term = f"{prompt} {top_tags}"
+                        logger.info(f"Triggering outfit builder with image. Base: '{base_item_desc}', New: '{new_item_type}'")
 
-                # No prompt, just an image.
+                        suggested_queries = refinement_service.suggest_style_queries(base_item_desc, new_item_type)
+                        
+                        if suggested_queries and rapidapi_amazon_service:
+                            logger.info(f"LLM suggested search queries for outfit: {suggested_queries}")
+                            for query_term in suggested_queries:
+                                api_products = rapidapi_amazon_service.search(query=query_term, country="IN")
+                                final_products.extend(api_products)
+                                logger.info(f"Found {len(api_products)} products for style query: '{query_term}'")
+                        else:
+                            logger.warning("Outfit builder failed to get suggestions, falling back to simple search.")
+                            initial_search_term = f"{' '.join(base_item_attributes)} {new_item_type}"
+                    else:
+                        logger.warning("Coordination prompt with image, but couldn't parse new item type. Falling back.")
+                        initial_search_term = ' '.join(generated_tags[:3]) if generated_tags else generated_caption
+
+                # Scenario: Image + Standard Prompt (e.g., "make it a brighter red")
+                elif prompt:
+                    top_tags = ' '.join(generated_tags[:3])
+                    initial_search_term = f"{prompt} {top_tags}"
+
+                # Scenario: Image only
                 else:
-                    if generated_tags:
-                        # Default search is the top 3 tags
-                        initial_search_term = ' '.join(generated_tags[:3])
-                    elif generated_caption:
-                        # If there are no tags and no prompt, fall back to the caption.
-                        initial_search_term = generated_caption
+                    initial_search_term = ' '.join(generated_tags[:3]) if generated_tags else generated_caption
 
                 logger.info(f"Image features extracted. Caption: '{generated_caption}'. Tags: {generated_tags}. Using '{initial_search_term}' for API search.")
 
             else:
                 return jsonify({"error": f"Failed to process image: {image_file.filename}. It may be corrupt."}), 500
+        
         # --- 1b. Contextual Search Logic (No Image) ---
-        else: # No image provided, this could be a follow-up query
-            is_contextual_query = any(keyword in prompt.lower() for keyword in CONTEXTUAL_REFERENCE_KEYWORDS)
+        else: 
+            if not prompt:
+                return jsonify({"error": "Please provide a prompt."}), 400
             
-            if is_contextual_query and last_search_context.get('primary_object_type'):
-                logger.info(f"Contextual query detected. Last context: {last_search_context}")
+            initial_search_term = ""
+            final_products = [] # Use this to hold products from multi-search
+
+            # Check for coordination intent first, as it's more specific
+            is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
+            if is_coordination_query and last_search_context.get('primary_object_type'):
+                logger.info(f"Outfit coordination query detected. Last context: {last_search_context}")
                 
-                # Extract new details from the current prompt
-                new_elements = extract_key_elements_from_query(prompt)
-                new_attributes = new_elements.get('primary_attributes', [])
-                
-                # Did the user ask for a completely new type of item?
                 new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
                 
-                # Build the new search term
-                if new_item_type:
-                    # e.g., "how about a jacket" -> search for "blue jacket" if last was "blue shirt"
-                    final_attributes = list(set(last_search_context.get('primary_attributes', []) + new_attributes))
-                    initial_search_term = f"{' '.join(final_attributes)} {new_item_type}"
+                if new_item_type and refinement_service:
+                    base_item_desc = f"{' '.join(last_search_context.get('primary_attributes', []))} {last_search_context.get('primary_object_type')}".strip()
+                    logger.info(f"Base item for style matching: '{base_item_desc}'. New item: '{new_item_type}'.")
+
+                    suggested_queries = refinement_service.suggest_style_queries(base_item_desc, new_item_type)
+                    
+                    if suggested_queries:
+                        logger.info(f"LLM suggested search queries: {suggested_queries}")
+                        all_api_products = []
+                        if rapidapi_amazon_service:
+                            for query in suggested_queries:
+                                api_products = rapidapi_amazon_service.search(query=query, country="IN")
+                                all_api_products.extend(api_products)
+                        
+                        initial_search_term = f"Finding items that go with a {base_item_desc}..." # This is more for logging now
+                        final_products = all_api_products # These products will bypass the initial search stage
+                    else:
+                        logger.warning("LLM style suggestion failed. Falling back to a simple search for the new item.")
+                        initial_search_term = new_item_type
                 else:
-                    # e.g., "in blue" -> search for "blue shirt" if last was "red shirt"
-                    final_attributes = list(set(new_attributes))
-                    # If no new attributes, keep the old ones.
-                    if not final_attributes:
-                        final_attributes = last_search_context.get('primary_attributes', [])
-                    initial_search_term = f"{' '.join(final_attributes)} {last_search_context['primary_object_type']}"
-                
-                logger.info(f"Constructed new search term from context: '{initial_search_term}'")
+                    logger.info("Could not determine new item for coordination, or no refinement service. Treating as standard search.")
+                    initial_search_term = prompt
+            
+            # If not coordination, check for standard attribute change
             else:
-                # Not a contextual query, or no context available. Treat as a new search.
-                last_search_context.clear() # Clear context
-                logger.info("No image and not a contextual query. Treating as a new search.")
+                is_contextual_query = any(keyword in prompt.lower() for keyword in CONTEXTUAL_REFERENCE_KEYWORDS)
+                if is_contextual_query and last_search_context.get('primary_object_type'):
+                    logger.info(f"Standard contextual query detected. Last context: {last_search_context}")
+                    
+                    new_elements = extract_key_elements_from_query(prompt)
+                    new_attributes = new_elements.get('primary_attributes', [])
+                    new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
+                    
+                    if new_item_type:
+                        final_attributes = list(set(last_search_context.get('primary_attributes', []) + new_attributes))
+                        initial_search_term = f"{' '.join(final_attributes)} {new_item_type}"
+                    else:
+                        final_attributes = list(set(new_attributes))
+                        if not final_attributes:
+                            final_attributes = last_search_context.get('primary_attributes', [])
+                        initial_search_term = f"{' '.join(final_attributes)} {last_search_context['primary_object_type']}"
+                    
+                    logger.info(f"Constructed new search term from context: '{initial_search_term}'")
+                
+                # If nothing contextual matches, it's a new search
+                else:
+                    last_search_context.clear()
+                    logger.info("No image and not a contextual query. Treating as a new search.")
+                    initial_search_term = prompt
 
         # --- 2. Initial Product Retrieval ---
-        # We need an initial set of products to work with, either for the LLM to refine
-        # or to populate our vector index for similarity search.
-        
-        api_products = []
-        # Only perform an API search if we have a search term (from prompt or caption)
-        if initial_search_term:
+        # This stage is skipped if the outfit builder (with or without image) already populated `final_products`
+        if not final_products and initial_search_term:
             logger.info(f"Performing initial product search on APIs with term: '{initial_search_term}'")
-            # For simplicity, let's just use the Amazon service for now. This can be expanded.
             if rapidapi_amazon_service:
                 api_products = rapidapi_amazon_service.search(query=initial_search_term, country="IN")
                 logger.info(f"Found {len(api_products)} products from API search.")
-        
-        # --- 3. Vector Index Management ---
-        # If the index is empty, build it with the products we just got from the API.
-        if embedding_service.index.ntotal == 0:
-            if api_products:
-                logger.info("FAISS index is empty. Building index with products from API search.")
-                embedding_service.build_index(api_products)
+                final_products.extend(api_products)
             else:
-                logger.warning("FAISS index is empty, but no API products were found to build it.")
+                logger.warning("No product search service available. Unable to perform initial search.")
 
-        # --- 4. Image Similarity Search ---
-        # If an image was provided, now we can perform the similarity search against the (now populated) index.
-        similar_products = []
-        if image_object:
-            logger.info(f"Finding similar products for the uploaded image...")
-            similar_products = embedding_service.find_similar(
-                query_image=image_object,
-                k=20 # Fetch more to allow for merging/deduping
-            )
-            logger.info(f"Found {len(similar_products)} candidates from image similarity search.")
+        # --- 3. Vector Index Management ---
+        # The vector index is only relevant for image-based searches, which are handled above.
+        # For text-based outfit building, we rely on the API results.
+        
+        # --- 4. Product Merging ---
+        # The `final_products` list already contains the merged results from the multi-search or single search.
+        # We just need to deduplicate them.
+        unique_products = {p['id']: p for p in final_products}.values()
+        logger.info(f"Final list contains {len(unique_products)} unique products.")
 
-        # --- 5. Merge and Combine Results ---
-        # Combine the results from the initial API search and the similarity search.
-        # `merge_and_dedupe_products` prioritizes the first list, so we put the most relevant results first.
-        # If a similarity search was done, those results are likely more relevant.
-        if similar_products:
-            all_products = merge_and_dedupe_products(similar_products, api_products)
-        else:
-            all_products = api_products
-
-        if not all_products:
-            logger.info("No products found from any source.")
-            bot_message = {
-                "isBot": True,
-                "text": "I couldn't find any products matching your request. Could you try being more specific or upload a different image?",
-                "products": [],
-            }
-            return jsonify(bot_message)
+        # --- 5. Context Update ---
+        # Update context based on the *new* search that was just performed.
+        if initial_search_term:
+             # This part might need refinement. What is the "primary object" of a style search?
+             # For now, let's not pollute the context on a style search.
+            is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
+            if not is_coordination_query:
+                context_elements = extract_key_elements_from_query(initial_search_term)
+                last_search_context.update({
+                    'primary_object_type': context_elements.get('primary_object_type'),
+                    'primary_attributes': context_elements.get('primary_attributes', [])
+                })
+                logger.debug(f"Updated last_search_context: {last_search_context}")
 
         # --- 6. LLM Refinement ---
-        final_products = all_products
-        # Only refine if the user provided a specific, non-generic text prompt.
-        if prompt and refinement_service and final_products:
-            # Check if we should skip refinement due to a generic prompt with an image
-            if image_file and prompt.lower().strip() in GENERIC_PROMPTS:
-                logger.info(f"Skipping LLM refinement because a generic prompt ('{prompt}') was used with an image.")
-                # The 'final_products' is already 'all_products', so no change needed.
-            else:
-                logger.info(f"Refining {len(all_products)} products with prompt: '{prompt}'")
-                refined_products = refinement_service.refine_results(all_products, prompt)
-                
-                # If refinement returns a valid (even if empty) list, use it.
-                # If it returns None (indicating an error), or an empty list when we had candidates, fall back.
-                if refined_products is not None and len(refined_products) > 0:
-                    logger.info(f"LLM refinement successful. Previous count: {len(all_products)}, New count: {len(refined_products)}.")
-                    final_products = refined_products
-                elif refined_products is not None and len(refined_products) == 0:
-                    logger.info("LLM refinement returned 0 products. Keeping original list.")
-                    # Keep final_products as all_products
-                else: # refined_products is None or something unexpected
-                    logger.warning("LLM refinement failed or returned an unexpected value. Falling back to pre-refinement list.")
-                    # Keep final_products as all_products
+        # The LLM has already been used for suggestions. We can probably skip re-ranking for now.
+        # Or, we could re-rank the merged list against the original user prompt.
+        # For simplicity, we will skip refinement for style queries for now.
 
         # --- 7. Final Response ---
-        # Store the key information from this search to be used as context for the next turn.
-        if final_products:
-            # For simplicity, context is based on the top result
-            top_result = final_products[0]
-            last_search_context = {
-                'primary_object_type': extract_key_elements_from_query(top_result.get('product_title', ''))['primary_object_type'],
-                'primary_attributes': extract_key_elements_from_query(top_result.get('product_title', ''))['primary_attributes'],
-                'product_id': top_result.get('product_id'),
-                'product_title': top_result.get('product_title')
-            }
-            logger.debug(f"Updated last_search_context: {last_search_context}")
+        response_text = f"Here are {len(unique_products)} products I found based on your request."
+        is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
+        if is_coordination_query and unique_products:
+            # Re-calculate base_item_desc if it was a no-image query
+            if not image_file and last_search_context.get('primary_object_type'):
+                 base_item_desc = f"{' '.join(last_search_context.get('primary_attributes', []))} {last_search_context.get('primary_object_type')}".strip()
+            elif image_file: # Re-calculate for image-based coordination query
+                 base_item_attributes = [tag for tag in generated_tags if tag not in KNOWN_OBJECT_TYPES]
+                 base_item_type = next((tag for tag in generated_tags if tag in KNOWN_OBJECT_TYPES), "item")
+                 base_item_desc = f"{' '.join(base_item_attributes)} {base_item_type}".strip()
+            else:
+                base_item_desc = "your previous item"
 
-        bot_response = {
-            "isBot": True,
-            "text": f"Here are {len(final_products)} products I found based on your request.",
-            "products": final_products,
-        }
-        
-        # Prepend a contextual message if a caption was used.
-        if generated_caption and not prompt:
-             bot_response['text'] = f"Based on your image, which looks like a '{generated_caption}', I found these products."
-        
-        return jsonify(bot_response)
+            response_text = f"Based on your request, here are some items that might go well with the {base_item_desc}:"
+
+        return jsonify({
+            "text": response_text,
+            "products": list(unique_products),
+            "isBot": True
+        })
 
     except Exception as e:
         logger.critical(f"An unexpected error occurred in /api/query: {e}", exc_info=True)
-        return jsonify({"error": "An internal server error occurred."}), 500
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():

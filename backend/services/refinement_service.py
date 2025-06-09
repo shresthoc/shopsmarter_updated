@@ -243,6 +243,82 @@ Ensure your output is ONLY the JSON list and nothing else. For example: {example
             logger.error(f"Traceback: {traceback.format_exc()}")
             return products
 
+    def suggest_style_queries(self, base_item_description: str, new_item_type: str, num_suggestions: int = 3) -> List[str]:
+        """
+        Uses the LLM to suggest search queries for an item that would stylistically match a base item.
+        
+        Args:
+            base_item_description: A description of the item the user already has (e.g., "black t-shirt").
+            new_item_type: The type of new item the user wants (e.g., "jacket").
+            num_suggestions: The number of different search queries to generate.
+            
+        Returns:
+            A list of suggested search query strings.
+        """
+        if not self.model:
+            logger.warning("LLM model not loaded, cannot suggest style queries.")
+            return []
+
+        prompt = f"""You are a fashion stylist's assistant. A user has a '{base_item_description}' and wants to find a '{new_item_type}' that would go well with it. 
+Your task is to generate {num_suggestions} diverse and specific search query ideas for an online shopping website. 
+The queries should be practical and represent different styles (e.g., casual, formal, trendy). 
+Each search query MUST focus only on the requested item type ('{new_item_type}') and should NOT include other clothing items or accessories.
+Do not add any explanation, just return a single JSON list of strings.
+
+Example:
+Base Item: 'blue jeans'
+New Item: 'shoes'
+Output: ["white leather sneakers", "brown suede chelsea boots", "black canvas high-tops"]
+
+Base Item: '{base_item_description}'
+New Item: '{new_item_type}'
+Output:"""
+
+        logger.info(f"Generating style suggestions for base '{base_item_description}' and new item '{new_item_type}'.")
+        
+        try:
+            # Use similar generation params as the refinement task, but maybe allow more creativity
+            generation_params = {
+                "max_tokens": 256,
+                "temperature": 0.5, # Higher temperature for more creative/diverse suggestions
+                "top_p": 0.9,
+                "stop": ["]"], # Stop when the JSON list is closed
+                "echo": False,
+            }
+            if self.json_grammar:
+                generation_params["grammar"] = self.json_grammar
+
+            output = self.model(prompt, **generation_params)
+            
+            raw_response = output['choices'][0]['text'] + "]" # Append the closing bracket
+            logger.info(f"LLM raw response for style suggestion: {raw_response}")
+
+            # Robust JSON parsing
+            try:
+                # Find the start of the JSON array
+                json_start = raw_response.find('[')
+                if json_start == -1:
+                    logger.error("LLM did not return a JSON list for style suggestions.")
+                    return []
+                
+                # Parse the JSON from the identified start
+                suggestions = json.loads(raw_response[json_start:])
+                
+                if isinstance(suggestions, list) and all(isinstance(s, str) for s in suggestions):
+                    logger.info(f"Successfully parsed style suggestions: {suggestions}")
+                    return suggestions[:num_suggestions] # Ensure we don't return more than requested
+                else:
+                    logger.error(f"LLM returned a JSON object that was not a list of strings: {suggestions}")
+                    return []
+
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode JSON from LLM style suggestion response: {raw_response}")
+                return []
+
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during style suggestion generation: {e}")
+            return []
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     # --- IMPORTANT ---
