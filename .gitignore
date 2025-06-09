@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 backend/models/*.gguf
 backend/models/*.gguf
+backend/models/*.gguf
