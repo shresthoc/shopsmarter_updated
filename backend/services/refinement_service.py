@@ -261,8 +261,10 @@ Ensure your output is ONLY the JSON list and nothing else. For example: {example
 
         prompt = f"""You are a fashion stylist's assistant. A user has a '{base_item_description}' and wants to find a '{new_item_type}' that would go well with it. 
 Your task is to generate {num_suggestions} diverse and specific search query ideas for an online shopping website. 
-The queries should be practical and represent different styles (e.g., casual, formal, trendy). 
-Each search query MUST focus only on the requested item type ('{new_item_type}') and should NOT include other clothing items or accessories.
+The queries should be practical and represent different styles (e.g., casual, formal, trendy).
+
+IMPORTANT: The search queries must ONLY describe the '{new_item_type}'. They must NOT mention the original item ('{base_item_description}') or any other type of product.
+
 Do not add any explanation, just return a single JSON list of strings.
 
 Example:

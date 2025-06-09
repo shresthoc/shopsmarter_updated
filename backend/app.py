@@ -116,6 +116,14 @@ COORDINATION_KEYWORDS = {
     "complete the look", "find a match for", "what to wear with"
 }
 
+# Keywords for learning user style preferences
+STYLE_KEYWORDS = {
+    "leather", "denim", "suede", "vintage", "bohemian", "floral", "minimalist",
+    "cotton", "linen", "wool", "silk", "cashmere", "velvet", "corduroy",
+    "graphic", "plaid", "striped", "polka dot", "athletic", "formal", "casual",
+    "retro", "modern", "classic", "chic", "edgy"
+}
+
 # Prompts that are too generic to be useful for API search when an image is provided
 GENERIC_PROMPTS = {
     "show similar products",
@@ -408,10 +416,10 @@ def query():
                 return jsonify({"error": "Please provide a prompt."}), 400
             
             initial_search_term = ""
-            final_products = [] # Use this to hold products from multi-search
-
-            # Check for coordination intent first, as it's more specific
+            final_products = [] 
             is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
+
+            # Check for coordination intent first
             if is_coordination_query and last_search_context.get('primary_object_type'):
                 logger.info(f"Outfit coordination query detected. Last context: {last_search_context}")
                 
@@ -440,32 +448,44 @@ def query():
                     logger.info("Could not determine new item for coordination, or no refinement service. Treating as standard search.")
                     initial_search_term = prompt
             
-            # If not coordination, check for standard attribute change
+            # If not coordination, check for standard attribute change or apply learned preferences
             else:
-                is_contextual_query = any(keyword in prompt.lower() for keyword in CONTEXTUAL_REFERENCE_KEYWORDS)
-                if is_contextual_query and last_search_context.get('primary_object_type'):
-                    logger.info(f"Standard contextual query detected. Last context: {last_search_context}")
-                    
-                    new_elements = extract_key_elements_from_query(prompt)
-                    new_attributes = new_elements.get('primary_attributes', [])
-                    new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
-                    
-                    if new_item_type:
-                        final_attributes = list(set(last_search_context.get('primary_attributes', []) + new_attributes))
-                        initial_search_term = f"{' '.join(final_attributes)} {new_item_type}"
-                    else:
-                        final_attributes = list(set(new_attributes))
-                        if not final_attributes:
-                            final_attributes = last_search_context.get('primary_attributes', [])
-                        initial_search_term = f"{' '.join(final_attributes)} {last_search_context['primary_object_type']}"
-                    
-                    logger.info(f"Constructed new search term from context: '{initial_search_term}'")
+                query_elements = extract_key_elements_from_query(prompt)
+                is_simple_query = len(query_elements.get('primary_attributes', [])) == 0 and query_elements.get('primary_object_type') is not None
                 
-                # If nothing contextual matches, it's a new search
+                # Apply learned preferences if the query is simple and we have learned some
+                if is_simple_query and last_search_context.get('learned_preferences'):
+                    preferences = ' '.join(last_search_context['learned_preferences'])
+                    new_item_type = query_elements.get('primary_object_type')
+                    initial_search_term = f"{preferences} {new_item_type}"
+                    logger.info(f"Applying learned preferences to simple query. New search term: '{initial_search_term}'")
+                
+                # Otherwise, fall back to the normal contextual logic
                 else:
-                    last_search_context.clear()
-                    logger.info("No image and not a contextual query. Treating as a new search.")
-                    initial_search_term = prompt
+                    is_contextual_query = any(keyword in prompt.lower() for keyword in CONTEXTUAL_REFERENCE_KEYWORDS)
+                    if is_contextual_query and last_search_context.get('primary_object_type'):
+                        logger.info(f"Standard contextual query detected. Last context: {last_search_context}")
+                        
+                        new_elements = extract_key_elements_from_query(prompt)
+                        new_attributes = new_elements.get('primary_attributes', [])
+                        new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
+                        
+                        if new_item_type:
+                            final_attributes = list(set(last_search_context.get('primary_attributes', []) + new_attributes))
+                            initial_search_term = f"{' '.join(final_attributes)} {new_item_type}"
+                        else:
+                            final_attributes = list(set(new_attributes))
+                            if not final_attributes:
+                                final_attributes = last_search_context.get('primary_attributes', [])
+                            initial_search_term = f"{' '.join(final_attributes)} {last_search_context['primary_object_type']}"
+                        
+                        logger.info(f"Constructed new search term from context: '{initial_search_term}'")
+                    
+                    # If nothing contextual matches, it's a new search
+                    else:
+                        last_search_context.clear()
+                        logger.info("No image and not a contextual query. Treating as a new search.")
+                        initial_search_term = prompt
 
         # --- 2. Initial Product Retrieval ---
         # This stage is skipped if the outfit builder (with or without image) already populated `final_products`
@@ -489,18 +509,28 @@ def query():
         logger.info(f"Final list contains {len(unique_products)} unique products.")
 
         # --- 5. Context Update ---
+        is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
+        
+        # Learn style preferences from the current successful search
+        # We do this for all search types, including coordination, to learn from results
+        current_preferences = set(last_search_context.get('learned_preferences', []))
+        words_to_scan = set(initial_search_term.lower().split())
+        for product in list(unique_products)[:5]: # Check top 5 results
+            words_to_scan.update(product.get('title', '').lower().split())
+        
+        for word in words_to_scan:
+            if word in STYLE_KEYWORDS:
+                current_preferences.add(word)
+        last_search_context['learned_preferences'] = list(current_preferences)
+        logger.info(f"Updated learned preferences: {last_search_context.get('learned_preferences')}")
+
         # Update context based on the *new* search that was just performed.
         if initial_search_term:
-             # This part might need refinement. What is the "primary object" of a style search?
-             # For now, let's not pollute the context on a style search.
-            is_coordination_query = any(keyword in prompt.lower() for keyword in COORDINATION_KEYWORDS)
             if not is_coordination_query:
                 context_elements = extract_key_elements_from_query(initial_search_term)
-                last_search_context.update({
-                    'primary_object_type': context_elements.get('primary_object_type'),
-                    'primary_attributes': context_elements.get('primary_attributes', [])
-                })
-                logger.debug(f"Updated last_search_context: {last_search_context}")
+                last_search_context['primary_object_type'] = context_elements.get('primary_object_type')
+                last_search_context['primary_attributes'] = context_elements.get('primary_attributes', [])
+                logger.debug(f"Updated primary object/attributes in context: {last_search_context}")
 
         # --- 6. LLM Refinement ---
         # The LLM has already been used for suggestions. We can probably skip re-ranking for now.
