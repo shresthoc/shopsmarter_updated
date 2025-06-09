@@ -8,7 +8,7 @@ import torch
 import numpy as np
 from PIL import Image
 import faiss
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 import requests
 from io import BytesIO
 import hashlib
@@ -441,3 +441,36 @@ class EmbeddingService:
             logger.error(f"Failed to load index: {str(e)}")
             self.index = faiss.IndexFlatL2(self.embedding_dim)
             self.product_map.clear()
+
+    def clear_index(self):
+        """Clears the FAISS index and the product map."""
+        self.index.reset()
+        self.product_map.clear()
+        logger.info("Cleared FAISS index and product map.")
+
+def clear_index():
+    """Clears the global FAISS index and the product map."""
+    global faiss_index, index_to_product_map
+    faiss_index = None
+    index_to_product_map.clear()
+    logger.info("Cleared FAISS index and product map.")
+
+def search_index(image: Union[str, Image.Image, bytes], top_k: int = 10, filter_threshold: float = 0.3) -> List[Dict]:
+    """
+    Searches the FAISS index for images similar to the query image.
+    """
+    if not image:
+        logger.error("A query image must be provided to search_index.")
+        return []
+
+    # Load the embedding service
+    embedding_service = EmbeddingService()
+
+    # Convert image to Image.Image if it's not already
+    if isinstance(image, (str, bytes)):
+        image = embedding_service._load_image(image)
+
+    # Get similar products
+    similar_products = embedding_service.find_similar(image, top_k, filter_threshold)
+
+    return similar_products

@@ -334,28 +334,53 @@ def query():
             
             # Reset context if a new image is uploaded, as it's a new search.
             last_search_context.clear()
+            embedding_service.clear_index() # Also clear the visual search index
             
             # Read image data into memory once
             image_data = image_file.read()
-            logger.info(f"Processing uploaded image: {image_file.filename} ({len(image_data)} bytes)")
 
-            # Get features (and the loaded image object)
-            image_object, image_features = embedding_service.get_features_for_image(image_data)
-            
-            if image_features:
-                generated_caption = image_features.get('caption')
-                generated_tags = image_features.get('tags')
+            # --- 1a. Feature Extraction from Image ---
+            image_object = embedding_service._load_image(image_data)
+            if image_object:
+                generated_tags = embedding_service.get_image_tags(image_object)
+                generated_caption = embedding_service.generate_caption(image_object)
+                
+                # --- 1b. Determine the initial search term ---
+                initial_search_term = "" # Initialize to empty
+                
+                # A prompt was provided WITH an image. This is a powerful combination.
+                if prompt:
+                    # Check if the prompt is asking for a new item type while referencing the image's attributes (e.g., color).
+                    new_item_type = parse_new_item_type_from_prompt(prompt, KNOWN_OBJECT_TYPES)
+                    
+                    if new_item_type:
+                        # User wants a new item type but in the style/color of the image.
+                        # We can use the image tags for attributes.
+                        # Example: Image of a "blue jeans", prompt is "show jackets in this colour" -> search for "blue jacket"
+                        # Extract attributes by taking tags that aren't also known item types.
+                        attributes = [tag for tag in generated_tags if tag not in KNOWN_OBJECT_TYPES and tag not in new_item_type]
+                        # We also want to extract color from the prompt itself, if present
+                        query_elements = extract_key_elements_from_query(prompt)
+                        attributes.extend(query_elements.get('primary_attributes', []))
+                        
+                        initial_search_term = f"{' '.join(list(set(attributes)))} {new_item_type}"
+                    else:
+                        # The prompt is likely a refinement on the item in the image, e.g., "a brighter red one"
+                        # For this, we can combine the prompt and the top tags.
+                        top_tags = ' '.join(generated_tags[:3])
+                        initial_search_term = f"{prompt} {top_tags}"
 
-                # If we have tags from the image and the user's prompt is generic or empty,
-                # prioritize the tags for a more specific initial search.
-                if generated_tags and (not prompt or prompt.lower().strip() in GENERIC_PROMPTS):
-                    # Combine the most relevant tags to form a search query.
-                    initial_search_term = " ".join(generated_tags[:3])
-                elif not prompt and generated_caption:
-                    # If there are no tags and no prompt, fall back to the caption.
-                    initial_search_term = generated_caption
+                # No prompt, just an image.
+                else:
+                    if generated_tags:
+                        # Default search is the top 3 tags
+                        initial_search_term = ' '.join(generated_tags[:3])
+                    elif generated_caption:
+                        # If there are no tags and no prompt, fall back to the caption.
+                        initial_search_term = generated_caption
 
                 logger.info(f"Image features extracted. Caption: '{generated_caption}'. Tags: {generated_tags}. Using '{initial_search_term}' for API search.")
+
             else:
                 return jsonify({"error": f"Failed to process image: {image_file.filename}. It may be corrupt."}), 500
         # --- 1b. Contextual Search Logic (No Image) ---
